@@ -1,9 +1,6 @@
 # FlatOut 2 — PS Vita Port
 
-Нативный порт оригинальной Xbox-версии **FlatOut 2** для **PlayStation Vita** на базе статической рекомпиляции (`xboxrecomp`).
-
-![Platform](https://shields.io)
-![Status](https://shields.io)
+Нативный порт оригинальной Xbox-версии **FlatOut 2** для **PlayStation Vita**.
 
 > [!IMPORTANT]
 > **Игровые файлы не включены в репозиторий.** Для запуска требуются файлы из вашей собственной копии игры для оригинального Xbox (`default.xbe`, `flatout2.bfs`, `Data/` и др.).
@@ -13,7 +10,6 @@
 * `src/` — основной код порта и ручные правки (`recomp_manual.c`)
 * `vita/` — платформенный слой для PS Vita
 * `config/` — конфигурация и точки входа (`seed_functions.json`)
-* `xboxrecomp/` — инструментарий статической рекомпиляции
 * `tools/` — вспомогательные скрипты
 
 ## Сборка
