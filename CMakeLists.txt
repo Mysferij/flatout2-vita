@@ -1,0 +1,214 @@
+cmake_minimum_required(VERSION 3.20)
+
+# ============================================================================
+# FlatOut 2 (Xbox, USA/Europe) - Static Recompilation
+#
+# Hosts: Windows (MSVC, D3D11), Linux (GCC, SDL2 + OpenGL) and Nintendo
+# Switch homebrew (devkitA64 + libnx, built with switch/build.sh).
+# ============================================================================
+
+project(fo2_recomp C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+add_compile_definitions(
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
+set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/xboxrecomp" CACHE PATH
+    "Path to the xboxrecomp toolkit root directory")
+
+# The lifted code is ~100 MB of C generated from the retail XBE. It is never
+# committed; point this at wherever tools.recomp --gen-dir wrote it.
+set(NFSU2_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen" CACHE PATH
+    "Directory holding the tools.recomp output (recomp_*.c, recomp_funcs.h)")
+
+if(NOT EXISTS "${NFSU2_GEN_DIR}/recomp_funcs.h")
+    message(FATAL_ERROR "No generated code in ${NFSU2_GEN_DIR}. Run tools.recomp "
+                        "with --gen-dir, or pass -DNFSU2_GEN_DIR=<dir>.")
+endif()
+
+# The Vulkan renderer (xboxrecomp nv2a_vk) instead of OpenGL. On the Switch it
+# links mesa-switch's static NVK (NVK_SDK) and builds fo2x-vulkan.nro.
+option(NFSU2_VULKAN "Render with Vulkan instead of OpenGL" OFF)
+set(XBOXRECOMP_VULKAN ${NFSU2_VULKAN} CACHE BOOL "" FORCE)
+
+if(VITA)
+    # Vita: size over speed, the eboot must fit in the app's RAM (the
+    # generated code is set further down, NFSU2_GEN_OPT).
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+endif()
+
+add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+
+file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "${NFSU2_GEN_DIR}/*.c")
+
+if(VITA)
+    set(GAME_SOURCES
+        src/main.c
+        src/recomp_manual.c
+        src/vita.c
+    )
+else()
+    set(GAME_SOURCES
+        src/main.c
+        src/recomp_manual.c
+        src/switch_nx.c
+        src/switch_saltynx.c
+    )
+endif()
+
+if(WIN32)
+    add_executable(${PROJECT_NAME} WIN32 ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+else()
+    add_executable(${PROJECT_NAME} ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp z)
+
+# Movies: VP6 decoded by FFmpeg instead of the lifted On2 decoder
+# (src/movie_vp6.c). NFSU2_FFMPEG_DIR is an install of the minimal LGPL
+# build from tools/build_ffmpeg_vp6.sh (libavcodec with only the vp6
+# decoder); without it the lifted decoder plays the movies.
+set(NFSU2_FFMPEG_DIR "" CACHE PATH "FFmpeg (vp6 decoder) install prefix")
+if(NFSU2_FFMPEG_DIR)
+    if(NOT EXISTS "${NFSU2_FFMPEG_DIR}/lib/libavcodec.a")
+        message(FATAL_ERROR "no libavcodec.a in ${NFSU2_FFMPEG_DIR}/lib (tools/build_ffmpeg_vp6.sh)")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE src/movie_vp6.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_NATIVE_VP6=1)
+    # BEFORE: the Switch portlibs include dir has devkitPro's (GPL) FFmpeg headers.
+    target_include_directories(${PROJECT_NAME} BEFORE PRIVATE "${NFSU2_FFMPEG_DIR}/include")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "${NFSU2_FFMPEG_DIR}/lib/libavcodec.a" "${NFSU2_FFMPEG_DIR}/lib/libavutil.a")
+endif()
+
+if(NFSU2_VULKAN)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NFSU2_VULKAN=1)
+endif()
+
+# No fold of the tiled aperture on every guest access (the Switch default):
+# FlatOut 2's game code never goes through 0xF0000000; the libraries that do
+# (D3D, D3DX, XGRPH, XMV) are lifted device-aware and fold on their own, and
+# the native XMV converter folds its surface. Checked on Linux with the
+# aperture unmapped (RECOMP_NO_TILED=1): intro movies, menus, a race.
+target_compile_definitions(${PROJECT_NAME} PRIVATE RECOMP_FOLD_TILED=0)
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${NFSU2_GEN_DIR}
+    ${XBOXRECOMP_DIR}/include
+)
+
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        d3d11 dxgi dxguid xinput winmm dbghelp)
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
+        target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    endif()
+else()
+    # The generated chunks are huge straight-line functions; -O1 keeps GCC's
+    # memory and time per chunk sane while still allocating registers. The
+    # Switch's CPU is the bottleneck there, so it gets -O2.
+    if(NINTENDO_SWITCH)
+        set(NFSU2_GEN_OPT "-O2" CACHE STRING "Optimisation for the lifted code")
+    elseif(VITA)
+        # 47 lifted chunks = most of the eboot's text. FORCE: an existing
+        # build dir caches -O1 and a plain CACHE set would not change it.
+        set(NFSU2_GEN_OPT "-O2" CACHE STRING "Optimisation for the lifted code" FORCE)
+    else()
+        set(NFSU2_GEN_OPT "-O1" CACHE STRING "Optimisation for the lifted code")
+    endif()
+    # NFSU2_LTO: link-time optimisation of the lifted code and its manual
+    # overrides, so lifted callers inline each other and the native leaves
+    # (_ftol2, ...). The runtime and renderers are compiled as usual.
+    # NFSU2_LTO_JOBS parallel LTRANS jobs (memory: ~1-2 GB each).
+    option(NFSU2_LTO "Link-time optimisation of the lifted code" OFF)
+    set(NFSU2_LTO_JOBS "4" CACHE STRING "Parallel LTO link jobs")
+    set(NFSU2_GEN_FLAGS "${NFSU2_GEN_OPT};-w;-fno-strict-aliasing;-fwrapv")
+    if(NFSU2_LTO)
+        list(APPEND NFSU2_GEN_FLAGS "-flto=auto")
+        set_property(SOURCE src/recomp_manual.c APPEND PROPERTY
+            COMPILE_OPTIONS "-flto=auto;-fno-strict-aliasing;-fwrapv")
+        target_link_options(${PROJECT_NAME} PRIVATE
+            "-flto=${NFSU2_LTO_JOBS}" "-flto-partition=balanced" ${NFSU2_GEN_OPT})
+    endif()
+    set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "${NFSU2_GEN_FLAGS}")
+    target_link_libraries(${PROJECT_NAME} PRIVATE m)
+endif()
+
+# ── Nintendo Switch homebrew (devkitA64 + libnx) ────────────────
+#
+# Build with switch/build.sh. The NRO reads the extracted disc from
+# sdmc:/switch/fo2x/game/ (never an ISO); logs and fo2x_env.txt live in
+# sdmc:/switch/fo2x/.
+if(NINTENDO_SWITCH)
+    set(NFSU2_SWITCH_APP_NAME "FlatOut 2 (Xbox recomp)" CACHE STRING
+        "Title shown in the homebrew menu")
+    set(NFSU2_SWITCH_AUTHOR "flatout2-xbox" CACHE STRING "Author shown in the homebrew menu")
+    # The release lives here, not in the cache: a cached default stays at
+    # whatever the build directory was first configured with.
+    # -DNFSU2_SWITCH_VERSION_OVERRIDE=x sets another one.
+    set(NFSU2_SWITCH_VERSION "0.2.1")
+    if(NFSU2_SWITCH_VERSION_OVERRIDE)
+        set(NFSU2_SWITCH_VERSION "${NFSU2_SWITCH_VERSION_OVERRIDE}")
+    endif()
+    set(NFSU2_SWITCH_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.jpg" CACHE FILEPATH
+        "256x256 JPEG icon (libnx default when empty)")
+
+    if(NFSU2_VULKAN)
+        # No GL: SDL is only the audio output; NVK comes with nv2a_vk.
+        target_link_libraries(${PROJECT_NAME} PRIVATE nx m)
+    else()
+        # switch-sdl2's GL path is EGL on switch-mesa.
+        target_link_libraries(${PROJECT_NAME} PRIVATE EGL glapi drm_nouveau nx m)
+    endif()
+    # SDL's audio thread gets a real-time priority and audren gaps are
+    # counted (switch_nx.c, "SDL's audio thread").
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "LINKER:--wrap=SDL_SYS_SetThreadPriority"
+        "LINKER:--wrap=audrvVoiceAddWaveBuf")
+    set_property(SOURCE src/switch_nx.c APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
+    # switch_nx.c's loading screen asks EGL for the on-screen size.
+    target_include_directories(${PROJECT_NAME} PRIVATE "$ENV{DEVKITPRO}/portlibs/switch/include")
+
+    set(NFSU2_NACP "${CMAKE_CURRENT_BINARY_DIR}/fo2x.nacp")
+    nx_generate_nacp(OUTPUT "${NFSU2_NACP}"
+        NAME "${NFSU2_SWITCH_APP_NAME}"
+        AUTHOR "${NFSU2_SWITCH_AUTHOR}"
+        VERSION "${NFSU2_SWITCH_VERSION}")
+    if(NFSU2_SWITCH_ICON)
+        nx_create_nro(${PROJECT_NAME} NACP "${NFSU2_NACP}" ICON "${NFSU2_SWITCH_ICON}")
+    else()
+        nx_create_nro(${PROJECT_NAME} NACP "${NFSU2_NACP}")
+    endif()
+endif()
+
+# ── PS Vita homebrew (VITASDK + vitaGL) ────────────────────────────
+#
+# Build with vita/build.sh. The ELF reads the extracted disc from
+# ux0:/data/fo2x/game/ (never an ISO); logs and fo2x_env.txt live in
+# ux0:/data/fo2x/.
+if(VITA)
+    # xbox_nv2a_gl (via xboxrecomp) references glViewport/glUseProgram/
+    # glBindTexture, so vitaGL and vitashark go after it on the link line.
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        xbox_nv2a_gl vitaGL vitashark mathneon SceShaccCgExt SceShaccCg_stub taihen_stub  SDL2
+        SceLibKernel_stub SceSysmem_stub SceDisplay_stub SceCtrl_stub SceAudio_stub SceGxm_stub
+        stdc++ m c)
+    set_property(SOURCE src/vita.c APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${XBOXRECOMP_DIR}/src/apu")
+    target_include_directories(${PROJECT_NAME} PRIVATE "$ENV{VITASDK}/arm-vita-eabi/include")
+    # vita-elf-create writes the SCE module info (imports/exports, ~3 KB for
+    # this stub set) into the gap between the text segment and the RW segment.
+    # The VitaSDK linker script places the RW segment at the next 64 KiB
+    # boundary after the text end + __sce_headroom, so the gap is at least
+    # this many bytes. Without it the gap was 0x868 bytes ("Cannot allocate
+    # 3080 bytes for SCE data at end of segment 0").
+    target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--defsym,__sce_headroom=0x4000")
+endif()
