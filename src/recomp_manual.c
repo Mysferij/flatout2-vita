@@ -1,3 +1,4 @@
+#include <zlib.h>
 #include <SDL2/SDL.h>
 /**
  * Manual function overrides and ICALL diagnostics
@@ -85,6 +86,18 @@ static void crt_memmove(void)
 }
 
 void sub_00218550(void) { crt_memmove(); }
+
+/* Safe native replacement for zlib adler32() (sub_00211EC0): pure math
+ * over guest buffer, touches no internal z_stream state. */
+void sub_00211EC0(void)
+{
+    uint32_t adler = MEM32(g_esp + 4u);
+    uint32_t buf_va = MEM32(g_esp + 8u);
+    uint32_t len = MEM32(g_esp + 12u);
+    const Bytef *buf = buf_va ? (const Bytef *)XBOX_PTR(buf_va) : Z_NULL;
+    g_eax = (uint32_t)adler32((uLong)adler, buf, (uInt)len);
+    g_esp += 4u;
+}
 
 /* Fast native replacements for MSVC CRT floating-point string parsers
  * (_atodbl, _atoflt, _fltin) that otherwise emulate 96-bit/80-bit x87
