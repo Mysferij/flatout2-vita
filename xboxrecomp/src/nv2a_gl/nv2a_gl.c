@@ -1871,24 +1871,16 @@ static int upload_vertices(const Nv2aRawBatch *b)
     }
 
     {
-        static int vbo_init = 0;
-        size_t chunk = (size_t)nv * 16;
-        if (!vbo_init) {
-            vbo_init = 1;
-            for (int k = 0; k < 3; k++) {
-                glBindBuffer(GL_ARRAY_BUFFER, vbo[k]);
-                glBufferData(GL_ARRAY_BUFFER, VITA_VSTREAM_BYTES, NULL, GL_DYNAMIC_DRAW);
-            }
-        }
-        if (s_vita_voff + chunk > VITA_VSTREAM_BYTES)
-            s_vita_voff = 0;
+        /* Правило №3: никакого glBufferSubData в кадре. buf[k] — статический
+         * RAM-буфер; glDrawElements прочитает его в этом же вызове.
+         * Клиентский указатель = 0 VBO. */
+        (void)vbo;
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
         for (int k = 0; k < 3; k++) {
             attr_enable((uint32_t)k, 1);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo[k]);
-            glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)s_vita_voff, (GLsizeiptr)chunk, buf[k]);
-            glVertexAttribPointer((GLuint)k, 4, GL_FLOAT, GL_FALSE, 16, (const void *)(uintptr_t)s_vita_voff);
+            glVertexAttribPointer((GLuint)k, 4, GL_FLOAT, GL_FALSE, 16,
+                                  (const void *)buf[k]);
         }
-        s_vita_voff += (chunk + 15u) & ~(size_t)15u;
     }
     return 1;
 #else
@@ -2343,7 +2335,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
                     r[0x1B00 / 4], (r[0x1B04 / 4] >> 8) & 0xFF);
 #if defined(__vita__)
         {
-            static GLuint v_ibo = 0;
             static const uint32_t quad6[6] = { 0, 1, 2, 0, 2, 3 };
             if (b->vertex_count == 4 && n < 6) {
                 idx = quad6;
@@ -2352,24 +2343,17 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             }
             static uint16_t *v_ibuf = NULL;
             static size_t v_icap = 0;
-            size_t ibytes = (size_t)n * 2;
-            if (!v_ibo) {
-                glGenBuffers(1, &v_ibo);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, v_ibo);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, VITA_VSTREAM_BYTES, NULL, GL_DYNAMIC_DRAW);
-            }
             if (n > v_icap) {
                 free(v_ibuf);
                 v_icap = n + 4096;
                 v_ibuf = (uint16_t *)malloc(v_icap * 2);
             }
-            if (v_ibuf && ibytes <= VITA_VSTREAM_BYTES) {
+            if (v_ibuf) {
                 for (uint32_t k = 0; k < n; k++) v_ibuf[k] = (uint16_t)idx[k];
-                if (s_vita_ioff + ibytes > VITA_VSTREAM_BYTES) s_vita_ioff = 0;
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, v_ibo);
-                glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)s_vita_ioff, (GLsizeiptr)ibytes, v_ibuf);
-                glDrawElements(mode, (GLsizei)n, GL_UNSIGNED_SHORT, (const void *)(uintptr_t)s_vita_ioff);
-                s_vita_ioff += (ibytes + 15u) & ~(size_t)15u;
+                /* Правило №3: клиентский указатель, без записи в IBO в кадре. */
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+                glDrawElements(mode, (GLsizei)n, GL_UNSIGNED_SHORT,
+                               (const void *)v_ibuf);
             }
         }
 #else

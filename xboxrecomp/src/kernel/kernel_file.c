@@ -955,8 +955,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 void (*xbox_file_read_hook)(void *buf, size_t len, int64_t offset);
 
 #if defined(__vita__)
+extern int xbox_gil_suspend(void);
+extern void xbox_gil_resume(int depth);
+
 #define VITA_RA_SLOTS 8
-#define VITA_RA_SIZE  (512u * 1024u)
+#define VITA_RA_SIZE  (1024u * 1024u)
 typedef struct {
     int     fd;
     int64_t buf_start;
@@ -1053,13 +1056,30 @@ NTSTATUS __stdcall xbox_NtReadFile(
                 slot->fd = fd;
             }
             if (slot && slot->buf) {
-                lseek(fd, (off_t)req_pos, SEEK_SET);
-                ssize_t rn = host_read(fd, slot->buf, VITA_RA_SIZE);
-                if (rn > 0) {
+                size_t keep = 0;
+                if (slot->buf_len > 0 &&
+                    req_pos >= slot->buf_start &&
+                    req_pos < slot->buf_start + (int64_t)slot->buf_len) {
+                    size_t off = (size_t)(req_pos - slot->buf_start);
+                    keep = slot->buf_len - off;
+                    if (keep > 0 && keep < VITA_RA_SIZE) {
+                        memmove(slot->buf, slot->buf + off, keep);
+                    } else {
+                        keep = 0;
+                    }
+                }
+                int gd = xbox_gil_suspend();
+                if (keep == 0 || slot->os_pos != req_pos + (int64_t)keep) {
+                    lseek(fd, (off_t)(req_pos + (int64_t)keep), SEEK_SET);
+                }
+                ssize_t rn = host_read(fd, slot->buf + keep, VITA_RA_SIZE - keep);
+                xbox_gil_resume(gd);
+                size_t total = keep + (rn > 0 ? (size_t)rn : 0u);
+                if (total > 0) {
                     slot->buf_start = req_pos;
-                    slot->buf_len = (size_t)rn;
-                    slot->os_pos = req_pos + (int64_t)rn;
-                    size_t take = (size_t)rn < (size_t)Length ? (size_t)rn : (size_t)Length;
+                    slot->buf_len = total;
+                    slot->os_pos = req_pos + (int64_t)total;
+                    size_t take = total < (size_t)Length ? total : (size_t)Length;
                     memcpy(Buffer, slot->buf, take);
                     slot->cur_pos = req_pos + (int64_t)take;
                     if (xbox_file_read_hook)
@@ -1085,16 +1105,16 @@ NTSTATUS __stdcall xbox_NtReadFile(
         pos = (int64_t)lseek(fd, 0, SEEK_CUR);
     }
 
-    ssize_t n = host_read(fd, Buffer, Length);
 #if defined(__vita__)
-    {   /* first 400 reads, then only the failed ones: the movie ring's reads */
-        static int s_vita_reads;
-        if (s_vita_reads < 400 || n <= 0) {
-            s_vita_reads++;
-            VITA_KLOG("NtReadFile handle=%p len=%u off=%lld -> %ld",
-                      FileHandle, (unsigned)Length, (long long)pos, (long)n);
-        }
+    int gd_big = xbox_gil_suspend();
+    ssize_t n = host_read(fd, Buffer, Length);
+    xbox_gil_resume(gd_big);
+    if (n < 0) {
+        VITA_KLOG("NtReadFile FAILED handle=%p len=%u off=%lld errno=%d",
+                  FileHandle, (unsigned)Length, (long long)pos, errno);
     }
+#else
+    ssize_t n = host_read(fd, Buffer, Length);
 #endif
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);

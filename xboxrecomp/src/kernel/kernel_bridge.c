@@ -3377,7 +3377,7 @@ void vita_log(const char *fmt, ...);
 #else
 #define TMR_LOG(...) do { } while (0)
 #endif
-#define TMR_TRACE_TICKS     100
+#define TMR_TRACE_TICKS     0   /* было 100: 100 тиков x 6 строк = лог-шторм на старте */
 #define TMR_HEARTBEAT_TICKS 1000
 
 /* Device interrupt lines live in xbox_devbus.c, so a device model can raise
@@ -3452,7 +3452,7 @@ static void kernel_drain_dpcs(void)
         if (GetTickCount64() > 10000ULL) {
             uint32_t r = 0; const uint8_t *kp = (const uint8_t *)XBOX_TO_NATIVE(d.dpc);
             if (kp) memcpy(&r, kp + 12, 4);
-            vita_log("[TMR-WATCH] enter dpc 0x%08X routine 0x%08X", (unsigned)d.dpc, (unsigned)r);
+            { static unsigned s_dpc_n; if ((s_dpc_n++ & 511u) == 0u) vita_log("[TMR-WATCH] enter dpc 0x%08X routine 0x%08X (#%u)", (unsigned)d.dpc, (unsigned)r, s_dpc_n); }
         }
         kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
@@ -3897,8 +3897,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc) {
                 uint32_t r = 0; const uint8_t *kp = (const uint8_t *)XBOX_TO_NATIVE(dpc);
+                (void)r;
                 if (kp) memcpy(&r, kp + 12, 4);
-                vita_log("[TMR-WATCH] enter timer dpc 0x%08X routine 0x%08X", (unsigned)dpc, (unsigned)r);
+                /* vita_log убран: синхронный sceIoWrite каждые 200 мс. */
                 kernel_run_dpc(dpc, 0, 0);
             }
             TMR_LOG("timer %d: DPC done", i);
@@ -10928,7 +10929,8 @@ static void kernel_thunk_dispatch_body(void)
                 "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0);
-        fflush(stderr);
+        /* fflush убран: синхронная запись на ux0: блокирует главный поток.
+         * Фоновый log_flusher (500 мс) сбросит буфер. */
     }
 
     {

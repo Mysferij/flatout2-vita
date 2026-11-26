@@ -85,6 +85,56 @@ static void crt_memmove(void)
 }
 
 void sub_00218550(void) { crt_memmove(); }
+
+/* Fast native replacements for MSVC CRT floating-point string parsers
+ * (_atodbl, _atoflt, _fltin) that otherwise emulate 96-bit/80-bit x87
+ * arithmetic digit-by-digit across thousands of config/Lua floats on LOADING. */
+void sub_002219BC(void) /* _atodbl(double *out, const char *str) */
+{
+    uint32_t out_va = MEM32(g_esp + 4u);
+    uint32_t str_va = MEM32(g_esp + 8u);
+    const char *s = (const char *)XBOX_PTR(str_va);
+    char *endp = NULL;
+    double val = strtod(s, &endp);
+    uint64_t bits = 0;
+    memcpy(&bits, &val, sizeof(bits));
+    MEM32(out_va) = (uint32_t)(bits & 0xFFFFFFFFull);
+    MEM32(out_va + 4u) = (uint32_t)(bits >> 32);
+    g_eax = 0u;
+    g_esp += 4u;
+}
+
+void sub_002219E9(void) /* _atoflt(float *out, const char *str) */
+{
+    uint32_t out_va = MEM32(g_esp + 4u);
+    uint32_t str_va = MEM32(g_esp + 8u);
+    const char *s = (const char *)XBOX_PTR(str_va);
+    char *endp = NULL;
+    float val = strtof(s, &endp);
+    uint32_t bits = 0;
+    memcpy(&bits, &val, sizeof(bits));
+    MEM32(out_va) = bits;
+    g_eax = 0u;
+    g_esp += 4u;
+}
+
+void sub_0021EDFC(void) /* _fltin(FLT *flt, const char *str, ...) */
+{
+    uint32_t flt_va = MEM32(g_esp + 4u);
+    uint32_t str_va = MEM32(g_esp + 8u);
+    const char *s = (const char *)XBOX_PTR(str_va);
+    char *endp = NULL;
+    double val = strtod(s, &endp);
+    uint32_t nbytes = (endp && endp > s) ? (uint32_t)(endp - s) : 0u;
+    uint64_t bits = 0;
+    memcpy(&bits, &val, sizeof(bits));
+    MEM32(flt_va + 0x00u) = 0u;
+    MEM32(flt_va + 0x04u) = nbytes;
+    MEM32(flt_va + 0x10u) = (uint32_t)(bits & 0xFFFFFFFFull);
+    MEM32(flt_va + 0x14u) = (uint32_t)(bits >> 32);
+    g_eax = flt_va;
+    g_esp += 4u;
+}
 void sub_0021BFD0(void) { crt_memmove(); }
 
 /* The title's own SSE memcpy (0x001C8380), cdecl (dst, src, count), chosen
@@ -201,6 +251,11 @@ void sub_00240240(void)
                     MEM32(sem) = want;
                 }
             }
+#if defined(__vita__)
+            eax = 0;
+            esp += 4 + 8;
+            return;
+#endif
         }
         sub_00240240_gen();
         return;
@@ -1370,49 +1425,6 @@ void fo2_vita_frame_tick(void)
 #if defined(__vita__)
     static unsigned s_ftick = 0u;
     s_ftick++;
-    if (s_ftick == 25u || s_ftick == 60u) {
-        fprintf(stderr, "[HANG_MAIN #%u]", s_ftick);
-        int p1 = 0;
-        for (uint32_t sp = 0x01CA0C00u; sp < 0x01CA1300u && p1 < 18; sp += 4u) {
-            uint32_t v = MEM32(sp);
-            if (v >= 0x00011000u && v < 0x00310000u) { fprintf(stderr, " %08X", (unsigned)v); p1++; }
-        }
-        extern RecompThreadTls *g_main_tls;
-        if (g_main_tls) {
-            uint32_t msp = g_main_tls->regs.r_esp;
-            fprintf(stderr, "\n[MAIN_TLS #%u] esp=0x%08X eax=0x%08X ecx=0x%08X kcall=0x%08X gil=%d spin=%u:",
-                    s_ftick, (unsigned)msp, (unsigned)g_main_tls->regs.r_eax,
-                    (unsigned)g_main_tls->regs.r_ecx, (unsigned)g_main_tls->kernel_caller,
-                    g_main_tls->gil_depth, g_main_tls->spin_turns);
-            int pm = 0;
-            if (msp >= 0x00780000u && msp < 0x00F80000u) {
-                for (uint32_t sp = msp; sp < msp + 0x1000u && sp < 0x00F80000u && pm < 24; sp += 4u) {
-                    uint32_t v = MEM32(sp);
-                    if (v >= 0x00011000u && v < 0x00310000u) { fprintf(stderr, " %08X", (unsigned)v); pm++; }
-                }
-            }
-        }
-        fprintf(stderr, "\n[HANG_LOW #%u]", s_ftick);
-        int pl = 0;
-        for (uint32_t sp = 0x00F68000u; sp < 0x00F7C000u && pl < 32; sp += 4u) {
-            uint32_t v = MEM32(sp);
-            if (v >= 0x00011000u && v < 0x00310000u) { fprintf(stderr, " %08X", (unsigned)v); pl++; }
-        }
-        fprintf(stderr, "\n[HANG_BOOT #%u]", s_ftick);
-        int p0 = 0;
-        for (uint32_t sp = 0x00F7C000u; sp < 0x00F80000u && p0 < 24; sp += 4u) {
-            uint32_t v = MEM32(sp);
-            if (v >= 0x00011000u && v < 0x00310000u) { fprintf(stderr, " %08X", (unsigned)v); p0++; }
-        }
-        fprintf(stderr, "\n[HANG_TH11 #%u]", s_ftick);
-        int p2 = 0;
-        for (uint32_t sp = 0x0193AD00u; sp < 0x0193B300u && p2 < 18; sp += 4u) {
-            uint32_t v = MEM32(sp);
-            if (v >= 0x00011000u && v < 0x00310000u) { fprintf(stderr, " %08X", (unsigned)v); p2++; }
-        }
-        fprintf(stderr, "\n");
-        fflush(stderr);
-    }
     static uint16_t s_prev_frame_btn = 0u;
     uint8_t rep[20];
     fo2_vita_report(rep);

@@ -9,3 +9,8 @@ build*/
 *.bfs
 *.iso
 __pycache__/
+build*/
+*.vpk
+*.bfs
+*.xmv
+*.bin

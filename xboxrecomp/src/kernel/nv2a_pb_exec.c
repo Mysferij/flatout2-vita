@@ -47,7 +47,10 @@ extern void *xbox_GuestPtr(uint32_t va);
 #if defined(__vita__)
 void vita_log(const char *fmt, ...);
 extern void *xbox_GuestHostRange(uint32_t va, uint64_t bytes);
-#define PBX_LOG(...) vita_log("[PB] " __VA_ARGS__)
+/* PBX_LOG выключен на Vita: синхронный sceIoWrite на карту в hot path
+ * (clear_surface, raw batch, flip) стоит секунды загрузки и роняет FPS.
+ * Для отладки вернуть vita_log("[PB] " __VA_ARGS__). */
+#define PBX_LOG(...) ((void)0)
 #else
 #define PBX_LOG(...) ((void)0)
 #endif
@@ -1277,7 +1280,7 @@ static void pbx_method_trace(uint32_t subch, uint32_t method, uint32_t param, ui
     if (!s_pbx_clears_seen || s_pbx_after_clear >= PBX_AFTER_CLEAR_MAX)
         return;
     s_pbx_after_clear++;
-    PBX_LOG("after clear %u: subch %u method 0x%04X param 0x%08X count %u",
+    PBX_FIRST(64, "after clear %u: subch %u method 0x%04X param 0x%08X count %u",
             s_pbx_after_clear, subch, method, param, count);
 }
 
@@ -4358,9 +4361,9 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
     extern void xbox_Nv2aHoldInterrupts(int on);
     extern int  xbox_gil_suspend(void);
     extern void xbox_gil_resume(int depth);
-    ULONGLONG give_up = GetTickCount64() + 5;
+    ULONGLONG give_up = GetTickCount64() + (((param & 0x1Fu) == 1u) ? 5u : 1u);
     static unsigned handled_n;
-    int gil;
+    int gil, spins = 0;
 
     xbox_Nv2aHoldInterrupts(1);        /* the ack thread leaves PGRAPH alone */
     while (InterlockedCompareExchange(&s_trap_lock, 1, 0) != 0)
@@ -4395,7 +4398,10 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
             nv2a_pb_trap_taken();
             break;
         }
-        WaitForSingleObject(driver_event(), 1);
+        if (spins++ < 8)
+            Sleep(0);
+        else
+            WaitForSingleObject(driver_event(), 1);
     }
     xbox_gil_resume(gil);
     xbox_set_irq_line(3, 0);
