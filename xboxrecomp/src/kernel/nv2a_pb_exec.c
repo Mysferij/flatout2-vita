@@ -1261,6 +1261,82 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
         PBX_FIRST(64, "texture decode: 0x%08X not host-mapped", t.offset);
         return 0;
     }
+    if (tex->color == 0x0C || tex->color == 0x0E || tex->color == 0x0F) {
+        uint32_t block_bytes = (tex->color == 0x0C) ? 8u : 16u;
+        uint32_t bpr = (tex->width + 3u) / 4u;
+        uint32_t bph = (tex->height + 3u) / 4u;
+        const uint8_t *base = guest_span_host(tex->offset, (uint64_t)bpr * bph * block_bytes);
+        if (!base) return 0;
+        for (uint32_t by = 0; by < bph; by++) {
+            uint32_t max_py = (by * 4u + 4u <= tex->height) ? 4u : (tex->height - by * 4u);
+            for (uint32_t bx = 0; bx < bpr; bx++) {
+                uint32_t max_px = (bx * 4u + 4u <= tex->width) ? 4u : (tex->width - bx * 4u);
+                const uint8_t *b = base + ((size_t)by * bpr + bx) * block_bytes;
+                uint32_t a_lut[16];
+                if (block_bytes == 16u) {
+                    if (tex->color == 0x0E) {
+                        for (uint32_t k = 0; k < 8u; k++) {
+                            uint32_t nib = b[k];
+                            a_lut[k * 2u]      = d3d8_expand_channel(nib & 0x0Fu, 4) << 24;
+                            a_lut[k * 2u + 1u] = d3d8_expand_channel(nib >> 4, 4) << 24;
+                        }
+                    } else {
+                        uint32_t a0 = b[0], a1 = b[1], atab[8];
+                        uint64_t bits = (uint64_t)b[2] | ((uint64_t)b[3] << 8)
+
+                                      | ((uint64_t)b[4] << 16) | ((uint64_t)b[5] << 24)
+                                      | ((uint64_t)b[6] << 32) | ((uint64_t)b[7] << 40);
+                        atab[0] = a0; atab[1] = a1;
+                        if (a0 > a1) {
+                            for (uint32_t i = 1; i < 7; i++)
+                                atab[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+                        } else {
+                            for (uint32_t i = 1; i < 5; i++)
+                                atab[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+                            atab[6] = 0; atab[7] = 255;
+                        }
+                        for (uint32_t k = 0; k < 16u; k++)
+                            a_lut[k] = atab[(uint32_t)((bits >> (3u * k)) & 7u)] << 24;
+                    }
+                    b += 8;
+                } else {
+                    for (uint32_t k = 0; k < 16u; k++) a_lut[k] = 0xFF000000u;
+                }
+                uint32_t c0 = (uint32_t)b[0] | ((uint32_t)b[1] << 8);
+                uint32_t c1 = (uint32_t)b[2] | ((uint32_t)b[3] << 8);
+                uint32_t c[4];
+                uint32_t r0 = d3d8_expand_channel((c0 >> 11) & 0x1Fu, 5);
+                uint32_t g0 = d3d8_expand_channel((c0 >>  5) & 0x3Fu, 6);
+                uint32_t b0 = d3d8_expand_channel( c0        & 0x1Fu, 5);
+                uint32_t r1 = d3d8_expand_channel((c1 >> 11) & 0x1Fu, 5);
+                uint32_t g1 = d3d8_expand_channel((c1 >>  5) & 0x3Fu, 6);
+                uint32_t b1 = d3d8_expand_channel( c1        & 0x1Fu, 5);
+                c[0] = (r0 << 16) | (g0 << 8) | b0;
+                c[1] = (r1 << 16) | (g1 << 8) | b1;
+                if (c0 > c1 || block_bytes == 16u) {
+                    c[2] = (((2 * r0 + r1) / 3) << 16) | (((2 * g0 + g1) / 3) << 8) | ((2 * b0 + b1) / 3);
+                    c[3] = (((r0 + 2 * r1) / 3) << 16) | (((g0 + 2 * g1) / 3) << 8) | ((b0 + 2 * b1) / 3);
+                } else {
+                    c[2] = (((r0 + r1) / 2) << 16) | (((g0 + g1) / 2) << 8) | ((b0 + b1) / 2);
+                    c[3] = 0;
+                }
+                uint32_t cbits = (uint32_t)b[4] | ((uint32_t)b[5] << 8)
+
+                               | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+                int has_punch = (block_bytes == 8u && c0 <= c1);
+                for (uint32_t py = 0; py < max_py; py++) {
+                    uint32_t *dst_row = argb_out + (size_t)(by * 4u + py) * tex->width + bx * 4u;
+                    for (uint32_t px = 0; px < max_px; px++) {
+                        uint32_t tidx = py * 4u + px;
+                        uint32_t idx = (cbits >> (2u * tidx)) & 3u;
+                        uint32_t a = (has_punch && idx == 3u) ? 0u : a_lut[tidx];
+                        dst_row[px] = a | c[idx];
+                    }
+                }
+            }
+        }
+        return 1;
+    }
     for (y = 0; y < tex->height && ok; y++)
         for (x = 0; x < tex->width; x++)
             if (!sample_texture(&t, x, y, &argb_out[(size_t)y * tex->width + x])) {

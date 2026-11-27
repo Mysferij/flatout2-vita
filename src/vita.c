@@ -109,8 +109,6 @@ static int  lpos;
 
 static void log_drain_locked(void)
 {
-    if (lpos > 0)
-        fwrite(lbuf, 1, (size_t)lpos, stderr);
     lpos = 0;
 }
 
@@ -138,7 +136,7 @@ void vita_log(const char *fmt, ...)
 
     if (strstr(buf, "[READ") || strstr(buf, "[ntavm]") || strstr(buf, "[HEAP") ||
         strstr(buf, "[KERNEL]   ordinal") || strstr(buf, "[GPU]   0x") ||
-        strstr(buf, "[fb] step") || strstr(buf, "[IRQLHOLD]") || strstr(buf, "[apu-step]") || strstr(buf, "[GL] tex_get") || strstr(buf, "[NV2A] DMA_PUT") || strstr(buf, "[KERNEL] summary"))
+        strstr(buf, "[fb] step") || strstr(buf, "[IRQLHOLD]") || strstr(buf, "[apu-step]") || strstr(buf, "[GL] tex_get") || strstr(buf, "[NV2A] DMA_PUT") || strstr(buf, "[KERNEL] summary") || strstr(buf, "[timer]"))
         return;
 
     if (strstr(buf, "[READ") || strstr(buf, "[ntavm]") || strstr(buf, "[HEAP") ||

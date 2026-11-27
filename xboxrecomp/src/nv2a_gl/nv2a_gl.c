@@ -563,7 +563,11 @@ static void tex_account(GlTex *t, uint32_t bytes)
     static uint64_t budget;
     if (!budget) {
         const char *e = getenv("RECOMP_GL_TEX_MB");
+#if defined(__vita__)
+        budget = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 64) << 20;
+#else
         budget = (uint64_t)(e && atoi(e) > 0 ? atoi(e) : 256) << 20;
+#endif
     }
     s_tex_bytes += (uint64_t)bytes - t->bytes;
     t->bytes = bytes;
@@ -622,8 +626,10 @@ static GLuint tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h,
             if (!c->tex) { if (!victim || victim->tex) victim = c; }
             else if (!victim || (victim->tex && c->used < victim->used)) victim = c;
         }
-    /* Once per frame per texture is enough to notice an update. */
-    if (t && t->checked == s_frame) {
+    /* Once per frame per texture is enough to notice an update.
+     * On Vita, large linear textures (>32KB) only re-hash every 8 frames to save CPU. */
+    if (t && (t->checked == s_frame ||
+              (pitch && (uint64_t)pitch * h > 32768u && (s_frame - t->checked) < 8u))) {
         t->used = s_frame;
         return t->tex;
     }
@@ -1433,6 +1439,18 @@ static int ready(void)
     SDL_GL_SetSwapInterval(0);
     if (nv2a_gl_load(SDL_GL_GetProcAddress) != 0)
         return 0;
+#endif
+#if defined(__vita__)
+    {
+        extern int scePowerSetArmClockFrequency(int);
+        extern int scePowerSetBusClockFrequency(int);
+        extern int scePowerSetGpuClockFrequency(int);
+        extern int scePowerSetGpuXbarClockFrequency(int);
+        scePowerSetArmClockFrequency(444);
+        scePowerSetBusClockFrequency(222);
+        scePowerSetGpuClockFrequency(222);
+        scePowerSetGpuXbarClockFrequency(166);
+    }
 #endif
     fprintf(stderr, "  [GL] %s / %s / %s\n", (const char *)glGetString(GL_VENDOR),
             (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));

@@ -2710,7 +2710,7 @@ static void bridge_KeDelayExecutionThread(void)
 {
     static uint32_t s_delay_cnt = 0u;
     s_delay_cnt++;
-    if (s_delay_cnt == 15000u || (s_delay_cnt > 15000u && (s_delay_cnt % 1500u) == 0u)) {
+    if (0 && (s_delay_cnt == 15000u || (s_delay_cnt > 15000u && (s_delay_cnt % 1500u) == 0u))) {
 #if defined(__vita__)
         extern RecompThreadTls *g_main_tls;
         if (g_main_tls) {

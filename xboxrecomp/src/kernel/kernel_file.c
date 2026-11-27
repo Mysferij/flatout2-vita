@@ -1068,11 +1068,14 @@ NTSTATUS __stdcall xbox_NtReadFile(
                         keep = 0;
                     }
                 }
+                size_t want_ra = (keep > 0) ? (VITA_RA_SIZE - keep) : (128u * 1024u);
+                if (want_ra < (size_t)Length) want_ra = (size_t)Length;
+                if (want_ra > VITA_RA_SIZE - keep) want_ra = VITA_RA_SIZE - keep;
                 int gd = xbox_gil_suspend();
                 if (keep == 0 || slot->os_pos != req_pos + (int64_t)keep) {
                     lseek(fd, (off_t)(req_pos + (int64_t)keep), SEEK_SET);
                 }
-                ssize_t rn = host_read(fd, slot->buf + keep, VITA_RA_SIZE - keep);
+                ssize_t rn = host_read(fd, slot->buf + keep, want_ra);
                 xbox_gil_resume(gd);
                 size_t total = keep + (rn > 0 ? (size_t)rn : 0u);
                 if (total > 0) {

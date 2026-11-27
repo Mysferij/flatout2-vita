@@ -1,3 +1,6 @@
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
 /*
  * kernel_thread.c - Xbox Threading Subsystem
  *
@@ -191,6 +194,19 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
     if (Interval->QuadPart < 0) {
         /* Negative = relative time in 100ns units. Convert to milliseconds. */
         LONGLONG relative_100ns = -Interval->QuadPart;
+#if defined(__vita__)
+        if (relative_100ns > 0 && relative_100ns <= 100000LL) {
+            xbox_kernel_busy(-1);
+            if (!Alertable) {
+                sceKernelDelayThread(250);
+            } else {
+                SleepEx(0, TRUE);
+                sceKernelDelayThread(250);
+            }
+            xbox_kernel_busy(1);
+            return STATUS_SUCCESS;
+        }
+#endif
         ms = (DWORD)(relative_100ns / 10000);
         /* Ensure at least 1ms for very short intervals */
         if (ms == 0 && relative_100ns > 0)
