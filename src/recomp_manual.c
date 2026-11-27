@@ -99,6 +99,159 @@ void sub_00211EC0(void)
     g_esp += 4u;
 }
 
+/* Native zlib inflate replacements for .bfs archive decompression:
+ * sub_0020FE54 = inflateInit2_
+ * sub_0020FFBA = inflateInit_
+ * sub_0020FFD5 = inflate
+ * sub_0020FD80 = inflateReset
+ * sub_0020FDEB = inflateEnd
+ */
+#include <pthread.h>
+#define FO2_ZPOOL_MAX 64
+#define FO2_ZTAG_MAGIC 0x5A4C0000u
+static pthread_mutex_t s_zlock = PTHREAD_MUTEX_INITIALIZER;
+static z_stream s_zpool[FO2_ZPOOL_MAX];
+static uint8_t s_zused[FO2_ZPOOL_MAX];
+
+static int fo2_zslot_get(uint32_t strm_va)
+{
+    if (!strm_va) return -1;
+    uint32_t tag = MEM32(strm_va + 0x1Cu);
+    if ((tag & 0xFFFF0000u) != FO2_ZTAG_MAGIC) return -1;
+    int idx = (int)(tag & 0xFFFFu) - 1;
+    if (idx < 0 || idx >= FO2_ZPOOL_MAX || !s_zused[idx]) return -1;
+    return idx;
+}
+
+static int fo2_inflate_init2_impl(uint32_t strm_va, int windowBits, uint32_t ver_va, int stream_size)
+{
+    if (!ver_va || stream_size != 0x38) return Z_VERSION_ERROR;
+    if (!strm_va) return Z_STREAM_ERROR;
+    MEM32(strm_va + 0x18u) = 0u; /* msg */
+    MEM32(strm_va + 0x1Cu) = 0u; /* state */
+
+    pthread_mutex_lock(&s_zlock);
+    int slot = -1;
+    for (int i = 0; i < FO2_ZPOOL_MAX; i++) {
+        if (!s_zused[i]) {
+            s_zused[i] = 1;
+            memset(&s_zpool[i], 0, sizeof(z_stream));
+            slot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_zlock);
+
+    if (slot < 0) return Z_MEM_ERROR;
+    int ret = inflateInit2_(&s_zpool[slot], windowBits, ZLIB_VERSION, (int)sizeof(z_stream));
+    if (ret != Z_OK) {
+        pthread_mutex_lock(&s_zlock);
+        s_zused[slot] = 0;
+        pthread_mutex_unlock(&s_zlock);
+        return ret;
+    }
+    MEM32(strm_va + 0x08u) = 0u; /* total_in */
+    MEM32(strm_va + 0x14u) = 0u; /* total_out */
+    MEM32(strm_va + 0x1Cu) = FO2_ZTAG_MAGIC | (uint32_t)(slot + 1);
+    MEM32(strm_va + 0x30u) = (uint32_t)s_zpool[slot].adler;
+    return Z_OK;
+}
+
+void sub_0020FE54(void) /* inflateInit2_(strm, windowBits, version, stream_size) */
+{
+    uint32_t strm_va = MEM32(g_esp + 4u);
+    int windowBits   = (int)MEM32(g_esp + 8u);
+    uint32_t ver_va  = MEM32(g_esp + 12u);
+    int stream_size  = (int)MEM32(g_esp + 16u);
+    g_eax = (uint32_t)fo2_inflate_init2_impl(strm_va, windowBits, ver_va, stream_size);
+    g_esp += 4u;
+}
+
+void sub_0020FFBA(void) /* inflateInit_(strm, version, stream_size) */
+{
+    uint32_t strm_va = MEM32(g_esp + 4u);
+    uint32_t ver_va  = MEM32(g_esp + 8u);
+    int stream_size  = (int)MEM32(g_esp + 12u);
+    g_eax = (uint32_t)fo2_inflate_init2_impl(strm_va, MAX_WBITS, ver_va, stream_size);
+    g_esp += 4u;
+}
+
+void sub_0020FFD5(void) /* inflate(strm, flush) */
+{
+    uint32_t strm_va = MEM32(g_esp + 4u);
+    int flush        = (int)MEM32(g_esp + 8u);
+    int slot = fo2_zslot_get(strm_va);
+    if (slot < 0) {
+        g_eax = (uint32_t)Z_STREAM_ERROR;
+        g_esp += 4u;
+        return;
+    }
+    z_stream *zs = &s_zpool[slot];
+    uint32_t next_in_va  = MEM32(strm_va + 0x00u);
+    uint32_t avail_in    = MEM32(strm_va + 0x04u);
+    uint32_t next_out_va = MEM32(strm_va + 0x0Cu);
+    uint32_t avail_out   = MEM32(strm_va + 0x10u);
+
+    zs->next_in   = (next_in_va && avail_in) ? (Bytef *)XBOX_PTR(next_in_va) : Z_NULL;
+    zs->avail_in  = (uInt)avail_in;
+    zs->total_in  = (uLong)MEM32(strm_va + 0x08u);
+    zs->next_out  = (next_out_va && avail_out) ? (Bytef *)XBOX_PTR(next_out_va) : Z_NULL;
+    zs->avail_out = (uInt)avail_out;
+    zs->total_out = (uLong)MEM32(strm_va + 0x14u);
+
+    int ret = inflate(zs, flush);
+
+    uint32_t consumed = avail_in - (uint32_t)zs->avail_in;
+    uint32_t produced = avail_out - (uint32_t)zs->avail_out;
+    if (next_in_va)  MEM32(strm_va + 0x00u) = next_in_va + consumed;
+    MEM32(strm_va + 0x04u) = (uint32_t)zs->avail_in;
+    MEM32(strm_va + 0x08u) = (uint32_t)zs->total_in;
+    if (next_out_va) MEM32(strm_va + 0x0Cu) = next_out_va + produced;
+    MEM32(strm_va + 0x10u) = (uint32_t)zs->avail_out;
+    MEM32(strm_va + 0x14u) = (uint32_t)zs->total_out;
+    MEM32(strm_va + 0x2Cu) = (uint32_t)zs->data_type;
+    MEM32(strm_va + 0x30u) = (uint32_t)zs->adler;
+
+    g_eax = (uint32_t)ret;
+    g_esp += 4u;
+}
+
+void sub_0020FD80(void) /* inflateReset(strm) */
+{
+    uint32_t strm_va = MEM32(g_esp + 4u);
+    int slot = fo2_zslot_get(strm_va);
+    if (slot < 0) {
+        g_eax = (uint32_t)Z_STREAM_ERROR;
+        g_esp += 4u;
+        return;
+    }
+    int ret = inflateReset(&s_zpool[slot]);
+    MEM32(strm_va + 0x08u) = 0u;
+    MEM32(strm_va + 0x14u) = 0u;
+    MEM32(strm_va + 0x18u) = 0u;
+    MEM32(strm_va + 0x30u) = (uint32_t)s_zpool[slot].adler;
+    g_eax = (uint32_t)ret;
+    g_esp += 4u;
+}
+
+void sub_0020FDEB(void) /* inflateEnd(strm) */
+{
+    uint32_t strm_va = MEM32(g_esp + 4u);
+    int slot = fo2_zslot_get(strm_va);
+    if (slot < 0) {
+        g_eax = (uint32_t)Z_STREAM_ERROR;
+        g_esp += 4u;
+        return;
+    }
+    int ret = inflateEnd(&s_zpool[slot]);
+    pthread_mutex_lock(&s_zlock);
+    s_zused[slot] = 0;
+    pthread_mutex_unlock(&s_zlock);
+    MEM32(strm_va + 0x1Cu) = 0u;
+    g_eax = (uint32_t)ret;
+    g_esp += 4u;
+}
+
 /* Fast native replacements for MSVC CRT floating-point string parsers
  * (_atodbl, _atoflt, _fltin) that otherwise emulate 96-bit/80-bit x87
  * arithmetic digit-by-digit across thousands of config/Lua floats on LOADING. */

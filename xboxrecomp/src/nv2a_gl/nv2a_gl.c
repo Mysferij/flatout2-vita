@@ -506,19 +506,43 @@ static int decode_indexed(uint32_t va, uint32_t w, uint32_t h, uint32_t *out)
     uint32_t pal_va = s_palette_va;
     uint32_t entries = 256u >> ((s_palette_reg >> 2) & 3);
     const uint8_t *idx = mem + va;
+    uint32_t pal[256];
     uint32_t x, y;
 
     if (!(s_palette_reg & ~0x3Fu))
         return 0;
-    for (y = 0; y < h; y++)
-        for (x = 0; x < w; x++) {
-            uint32_t i = idx[swizzle_index(x, y, w, h)];
-            uint32_t c;
-            if (i >= entries)
-                i = 0;
-            memcpy(&c, mem + pal_va + i * 4, 4);
-            out[y * w + x] = c;
+    for (x = 0; x < entries; x++) {
+        uint32_t c;
+        memcpy(&c, mem + pal_va + x * 4, 4);
+#if defined(__vita__)
+        c = (c & 0xFF00FF00u) | ((c & 0x00FF0000u) >> 16) | ((c & 0x000000FFu) << 16);
+#endif
+        pal[x] = c;
+    }
+    for (; x < 256; x++)
+        pal[x] = pal[0];
+
+    static uint32_t *s_idx_lut = NULL;
+    static uint32_t s_idx_lut_cap = 0;
+    if (w + h > s_idx_lut_cap) {
+        uint32_t *nl = (uint32_t *)realloc(s_idx_lut, (size_t)(w + h) * sizeof(uint32_t));
+        if (nl) { s_idx_lut = nl; s_idx_lut_cap = w + h; }
+    }
+    if (s_idx_lut && s_idx_lut_cap >= w + h) {
+        uint32_t *lx = s_idx_lut, *ly = s_idx_lut + w;
+        for (x = 0; x < w; x++) lx[x] = swizzle_index(x, 0, w, h);
+        for (y = 0; y < h; y++) ly[y] = swizzle_index(0, y, w, h);
+        for (y = 0; y < h; y++) {
+            uint32_t *dst_row = out + (size_t)y * w;
+            uint32_t sy_off = ly[y];
+            for (x = 0; x < w; x++)
+                dst_row[x] = pal[idx[sy_off + lx[x]]];
         }
+    } else {
+        for (y = 0; y < h; y++)
+            for (x = 0; x < w; x++)
+                out[(size_t)y * w + x] = pal[idx[swizzle_index(x, y, w, h)]];
+    }
     return 1;
 }
 
@@ -756,7 +780,7 @@ if (s_decode && (color == 0x06 || color == 0x07) && w >= 1 && h >= 1) {
     } else if (s_decode && (color == 0x0B ? decode_indexed(va, w, h, s_decode)
                                     : nv2a_backend_decode_texture(&nt, s_decode))) {
 #if defined(__vita__)
-        {
+        if (color != 0x0B) {
             size_t npx = (size_t)w * h, pi;
             for (pi = 0; pi < npx; pi++) {
                 uint32_t c = s_decode[pi];
@@ -768,13 +792,19 @@ if (s_decode && (color == 0x06 || color == 0x07) && w >= 1 && h >= 1) {
         {
             uint32_t pw = vita_next_pow2(w), ph = vita_next_pow2(h);
             if (pw != w || ph != h) {
-                uint32_t *pot = (uint32_t *)calloc((size_t)pw * ph, 4);
-                if (pot) {
+                static uint32_t *s_pot = NULL;
+                static size_t s_pot_cap = 0;
+                size_t need = (size_t)pw * ph;
+                if (need > s_pot_cap) {
+                    uint32_t *np = (uint32_t *)realloc(s_pot, need * 4);
+                    if (np) { s_pot = np; s_pot_cap = need; }
+                }
+                if (s_pot && s_pot_cap >= need) {
+                    memset(s_pot, 0, need * 4);
                     for (uint32_t row = 0; row < h; row++)
-                        memcpy(pot + (size_t)row * pw, s_decode + (size_t)row * w, (size_t)w * 4);
+                        memcpy(s_pot + (size_t)row * pw, s_decode + (size_t)row * w, (size_t)w * 4);
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)pw, (GLsizei)ph, 0,
-                                 GL_RGBA, GL_UNSIGNED_BYTE, pot);
-                    free(pot);
+                                 GL_RGBA, GL_UNSIGNED_BYTE, s_pot);
                 } else {
                     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)w, (GLsizei)h, 0,
                                  GL_RGBA, GL_UNSIGNED_BYTE, s_decode);
@@ -1065,11 +1095,14 @@ static GLuint vita_fallback_program(void)
         "uniform vec4 u_surf;\n"
         "uniform vec2 u_aa;\n"
         "uniform int u_xform;\n"
-        "varying vec4 vD0;\n"
-        "varying vec4 vT0;\n"
+        "uniform vec2 u_tscale0;\n"
+        "varying lowp vec4 vD0;\n"
+        "varying mediump vec2 vT0;\n"
         "void main() {\n"
         "    vD0 = dot(v1.rgb, v1.rgb) < 1e-6 ? vec4(1.0) : clamp(v1, 0.0, 1.0);\n"
-        "    vT0 = v2;\n"
+        "    vec2 raw = abs(v2.w) > 1e-8 ? v2.xy / v2.w : v2.xy;\n"
+        "    vec2 ts = (u_tscale0.x > 0.0 && u_tscale0.y > 0.0) ? u_tscale0 : vec2(1.0);\n"
+        "    vT0 = (abs(raw.x) > 1.5 || abs(raw.y) > 1.5) ? (raw * ts) : raw;\n"
         "    if (u_xform == 0) {\n"
         "        vec3 s = vec3(v0.xy * u_aa, v0.z);\n"
         "        gl_Position = vec4(s.x * u_surf.x - 1.0, 1.0 - s.y * u_surf.y, 0.0, 1.0);\n"
@@ -1078,19 +1111,16 @@ static GLuint vita_fallback_program(void)
         "    }\n"
         "}\n";
     const char *fsrc =
-        "precision highp float;\n"
-        "varying vec4 vD0;\n"
-        "varying vec4 vT0;\n"
+        "precision mediump float;\n"
+        "varying lowp vec4 vD0;\n"
+        "varying mediump vec2 vT0;\n"
         "uniform sampler2D t0;\n"
-        "uniform vec2 u_tscale0;\n"
-        "uniform int u_has_tex;\n"
+        "uniform lowp int u_has_tex;\n"
         "void main() {\n"
         "    if (u_has_tex != 0) {\n"
-        "        vec2 raw = abs(vT0.w) > 1e-8 ? vT0.xy / vT0.w : vT0.xy;\n"
-        "        vec2 ts = (u_tscale0.x > 0.0 && u_tscale0.y > 0.0) ? u_tscale0 : vec2(1.0);\n"
-        "        vec2 tc = (abs(raw.x) > 1.5 || abs(raw.y) > 1.5) ? (raw * ts) : raw;\n"
-        "        vec4 tx = texture2D(t0, tc);\n"
-        "        gl_FragColor = vec4(tx.rgb * (dot(vD0.rgb, vD0.rgb) < 0.05 ? vec3(1.0) : vD0.rgb), tx.a);\n"
+        "        lowp vec4 tx = texture2D(t0, vT0);\n"
+        "        lowp vec3 col = dot(vD0.rgb, vD0.rgb) < 0.05 ? vec3(1.0) : vD0.rgb;\n"
+        "        gl_FragColor = vec4(tx.rgb * col, tx.a);\n"
         "    } else {\n"
         "        gl_FragColor = vD0;\n"
         "    }\n"

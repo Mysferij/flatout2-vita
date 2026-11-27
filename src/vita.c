@@ -264,6 +264,8 @@ void vita_boot(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IOFBF, 65536);
 
+    sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF, SCE_KERNEL_CPU_MASK_USER_0);
+    sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, 0x60);
     set_max_clocks();
     load_env();
     {

@@ -1115,6 +1115,12 @@ static void *thread_trampoline(void *arg)
     host_priority_apply(o);              /* a priority set before it ran */
 #endif
 
+#if defined(__vita__)
+    sceKernelChangeThreadCpuAffinityMask(SCE_KERNEL_THREAD_ID_SELF,
+                                         SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+    sceKernelChangeThreadPriority(SCE_KERNEL_THREAD_ID_SELF, 0x64);
+#endif
+
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
     while (o->suspend_count > 0)

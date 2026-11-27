@@ -2749,6 +2749,9 @@ static void bridge_KeDelayExecutionThread(void)
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(interval_ptr));
+#if defined(__vita__)
+    recomp_preempt();
+#endif
 }
 
 /* ── KeBugCheck (ordinal 95) / KeBugCheckEx (96) ─────────── */
