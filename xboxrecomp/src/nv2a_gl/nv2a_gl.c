@@ -2648,7 +2648,8 @@ static void gl_flip(void)
     glDisable(GL_BLEND);
     glColorMask(1, 1, 1, 1);
     glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
+    if (!s || !s->tex)
+        glClear(GL_COLOR_BUFFER_BIT);
     if (s && s->tex) {
         static GLuint pprog = 0;
         if (!pprog) {
@@ -2696,16 +2697,6 @@ static void gl_flip(void)
     }
 swap:
     gl_step_done("present");
-    {
-        static unsigned hb = 0;
-        hb++;
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(10, 10, (int)((hb % 120) * 3 + 12), 8);
-        glClearColor(0.95f, 0.45f, 0.05f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glDisable(GL_SCISSOR_TEST);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    }
     vglSwapBuffers(GL_FALSE);
     s_vita_voff = 0;
     s_vita_ioff = 0;

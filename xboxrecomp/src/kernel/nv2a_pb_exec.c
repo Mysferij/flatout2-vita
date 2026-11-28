@@ -4865,7 +4865,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * retired them, and D3D's two-entry flip queue was overwritten:
              * NFSU2's PersistDisplay then waited on a flip whose vblank had
              * gone by. */
+#if defined(__vita__)
+            ULONGLONG give_up = GetTickCount64();
+#else
             ULONGLONG give_up = GetTickCount64() + 250;
+#endif
             for (;;) {
                 flip_apply_retired();
                 if (s_gpu->flip_read != s_gpu->flip_write)
