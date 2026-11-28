@@ -186,18 +186,18 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 
 /* RECOMP_APU_BIN_STATS=1: RMS and peak of each mixbin every 5 s of audio
  * (which bins a title's voices land in, and how loud each is). */
+static int s_bin_stats_on = -1;
 static void bin_stats(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i)
 {
-    static int on = -1;
     static double sq[NUM_MIXBINS];
     static float pk[NUM_MIXBINS];
     static unsigned n;
     int b;
-    if (on < 0) {
+    if (s_bin_stats_on < 0) {
         const char *e = getenv("RECOMP_APU_BIN_STATS");
-        on = e && *e == '1';
+        s_bin_stats_on = e && *e == '1';
     }
-    if (!on)
+    if (!s_bin_stats_on)
         return;
     for (b = 0; b < NUM_MIXBINS; b++) {
         float v = mixbins[b][i];
@@ -247,7 +247,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      * For stereo output, bins 0 and 1 are what we want.
      */
 
-    int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    int off = (d->ep_frame_div & 7) * NUM_SAMPLES_PER_FRAME;
 
     dsp_ack_frame(d);
 
@@ -272,6 +272,12 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         static ApuLimiter lim;
         float lr[NUM_SAMPLES_PER_FRAME][2];
+        int mixdown_all;
+        if (s_bin_stats_on < 0) {
+            const char *e = getenv("RECOMP_APU_BIN_STATS");
+            s_bin_stats_on = e && *e == '1';
+        }
+        mixdown_all = mcpx_apu_mixdown_all();
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -302,13 +308,18 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * (s_downmix). This is not what a real EP does; it is the cheapest
              * mixdown that stops discarding audio. */
             float left, right;
-            bin_stats(mixbins, i);
-            if (mcpx_apu_mixdown_all()) {
+            if (s_bin_stats_on) bin_stats(mixbins, i);
+            if (mixdown_all) {
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    left  += s_downmix[b][0] * mixbins[b][i];
-                    right += s_downmix[b][1] * mixbins[b][i];
+                    float s = mixbins[b][i];
+                    if (s == 0.0f)
+                        continue;
+                    if (s_downmix[b][0] != 0.0f)
+                        left += s_downmix[b][0] * s;
+                    if (s_downmix[b][1] != 0.0f)
+                        right += s_downmix[b][1] * s;
                 }
             } else {
                 left = mixbins[0][i];
@@ -332,8 +343,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         /* Convert to 16-bit and write (not accumulate) into frame buffer.
          * Each of the 8 sub-frames writes its own 32-sample slice. */
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            d->monitor.frame_buf[off + i][0] = (int16_t)lrintf(lr[i][0] * 32767.0f);
-            d->monitor.frame_buf[off + i][1] = (int16_t)lrintf(lr[i][1] * 32767.0f);
+            d->monitor.frame_buf[off + i][0] = apu_s16_from_float(lr[i][0] * 32767.0f);
+            d->monitor.frame_buf[off + i][1] = apu_s16_from_float(lr[i][1] * 32767.0f);
         }
     }
 

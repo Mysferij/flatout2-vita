@@ -1050,6 +1050,7 @@ void apu_mixer_set_data(int slot, const int16_t *pcm, uint32_t bytes,
 static void mixer_render(int16_t frame_buf[][2], int num_samples)
 {
     if (!g_mixer_initialized) return;
+    if (g_mixer_active_count <= 0) return;
     APU_STEP("mixer: enter (%d samples, %d active voices)\n",
              num_samples, (int)g_mixer_active_count);
     EnterCriticalSection(&g_mixer_cs);

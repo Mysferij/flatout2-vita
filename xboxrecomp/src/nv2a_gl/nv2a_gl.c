@@ -72,17 +72,20 @@ static int           s_new_obj;          /* this operation uses something new */
  * synchronous log on an SD card. */
 static void gl_step_done(const char *what)
 {
-    int upload = what[0] == 't';          /* "texture upload": part of a draw */
+    int upload;
     if (s_finish < 0)
         s_finish = getenv("RECOMP_GL_FINISH") != NULL;
-    if (s_finish) {
-        glFinish();
-        if (s_new_obj)
-            fprintf(stderr, "  [GL] %s done\n", what);
-        else if (what[0] == 's') {        /* "swap": one line a frame, a heartbeat */
-            static unsigned swaps;
-            fprintf(stderr, "  [GL] frame %u swapped\n", ++swaps);
-        }
+    if (!s_finish) {
+        if (what[0] != 't') s_new_obj = 0;
+        return;
+    }
+    upload = what[0] == 't';
+    glFinish();
+    if (s_new_obj)
+        fprintf(stderr, "  [GL] %s done\n", what);
+    else if (what[0] == 's') {
+        static unsigned swaps;
+        fprintf(stderr, "  [GL] frame %u swapped\n", ++swaps);
     }
     if (!upload)
         s_new_obj = 0;                    /* the draw that uses it reports too */
@@ -103,6 +106,13 @@ static uint64_t hz_now(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static int s_hz_on = -1;
+static int hz_on(void)
+{
+    if (s_hz_on < 0)
+        s_hz_on = !xbox_log_quiet();
+    return s_hz_on;
 }
 static GLuint        s_cur_prog;         /* what glUseProgram last got */
 static void state_dirty(void);
@@ -594,9 +604,9 @@ static size_t s_vita_voff = 0, s_vita_ioff = 0;
 #define VITA_VSTREAM_BYTES (512 * 1024)
 static uint32_t vita_next_pow2(uint32_t v)
 {
-    uint32_t p = 1;
-    while (p < v) p <<= 1;
-    return p;
+    if (v <= 1)
+        return 1;
+    return 1u << (32 - __builtin_clz(v - 1));
 }
 #endif
 
@@ -742,9 +752,27 @@ if (s_decode && (color == 0x06 || color == 0x07) && w >= 1 && h >= 1) {
         const uint32_t *src = (const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset() + va);
 #endif
         uint32_t x, y, fill = color == 0x07 ? 0xFF000000u : 0;
-        for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++)
-                s_decode[(size_t)y * w + x] = src[swizzle_index(x, y, w, h)] | fill;
+        static uint32_t *s_sw_lut;
+        static uint32_t s_sw_cap;
+        if (w + h > s_sw_cap) {
+            uint32_t *nl = (uint32_t *)realloc(s_sw_lut, (size_t)(w + h) * sizeof(uint32_t));
+            if (nl) { s_sw_lut = nl; s_sw_cap = w + h; }
+        }
+        if (s_sw_lut && s_sw_cap >= w + h) {
+            uint32_t *lx = s_sw_lut, *ly = s_sw_lut + w;
+            for (x = 0; x < w; x++) lx[x] = swizzle_index(x, 0, w, h);
+            for (y = 0; y < h; y++) ly[y] = swizzle_index(0, y, w, h);
+            for (y = 0; y < h; y++) {
+                uint32_t *row = s_decode + (size_t)y * w;
+                uint32_t sy = ly[y];
+                for (x = 0; x < w; x++)
+                    row[x] = src[sy + lx[x]] | fill;
+            }
+        } else {
+            for (y = 0; y < h; y++)
+                for (x = 0; x < w; x++)
+                    s_decode[(size_t)y * w + x] = src[swizzle_index(x, y, w, h)] | fill;
+        }
 #if defined(__vita__)
         {
             size_t npx = (size_t)w * h, pi;
@@ -1526,7 +1554,18 @@ __attribute__((weak)) int nv2a_gl_screen_size(int *w, int *h)
 
 /* ── Render state ─────────────────────────────────────────────────── */
 
-static float byte_f(uint32_t v, int shift) { return (float)((v >> shift) & 0xFF) / 255.0f; }
+static float s_byte_f[256];
+static int s_byte_f_ready;
+static float byte_f(uint32_t v, int shift)
+{
+    if (!s_byte_f_ready) {
+        int i;
+        for (i = 0; i < 256; i++)
+            s_byte_f[i] = (float)i / 255.0f;
+        s_byte_f_ready = 1;
+    }
+    return s_byte_f[(v >> shift) & 0xFF];
+}
 
 static void argb_vec4(uint32_t v, float out[4])
 {
@@ -1887,10 +1926,10 @@ static int upload_vertices(const Nv2aRawBatch *b)
         if (col_slot >= 0 && (b->attr_direct & (1u << col_slot)) && b->direct[col_slot].ptr) {
             const uint8_t *src = b->direct[col_slot].ptr + (size_t)v * b->direct[col_slot].stride;
             if (b->direct[col_slot].type == 0 || b->direct[col_slot].type == 4) {
-                buf[1][v * 4 + 0] = src[2] / 255.0f;
-                buf[1][v * 4 + 1] = src[1] / 255.0f;
-                buf[1][v * 4 + 2] = src[0] / 255.0f;
-                buf[1][v * 4 + 3] = src[3] / 255.0f;
+                buf[1][v * 4 + 0] = byte_f(src[2], 0);
+                buf[1][v * 4 + 1] = byte_f(src[1], 0);
+                buf[1][v * 4 + 2] = byte_f(src[0], 0);
+                buf[1][v * 4 + 3] = byte_f(src[3], 0);
             } else if (b->direct[col_slot].type == 2) {
                 memcpy(buf[1] + v * 4, src, 16);
             }
@@ -2087,9 +2126,9 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     }
     {
         uint32_t made = s_prog_made;
-        uint64_t t0 = hz_now();
+        uint64_t t0 = hz_on() ? hz_now() : 0;
         p = prog_get(b, &pk);
-        if (s_prog_made != made) {
+        if (hz_on() && s_prog_made != made) {
             s_hz_progs += s_prog_made - made;
             s_hz_prog_ns += hz_now() - t0;
         }
@@ -2104,10 +2143,10 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
 
     {
         uint32_t texs = s_hz_texs;
-        uint64_t t0 = hz_now();
+        uint64_t t0 = hz_on() ? hz_now() : 0;
         for (i = 0; i < 4; i++)
             bind_stage(r, (int)i, tscale[i]);
-        if (s_hz_texs != texs)
+        if (hz_on() && s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
     }
     for (i = 0; i < 8; i++) {

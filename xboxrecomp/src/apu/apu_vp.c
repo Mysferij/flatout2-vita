@@ -100,10 +100,19 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+static float s_att_tab[4096];
+static int s_att_tab_ready;
 static float attenuate(uint16_t vol)
 {
-    vol &= 0xFFF;
-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+    unsigned v = vol & 0xFFFu;
+    if (!s_att_tab_ready) {
+        int i;
+        for (i = 0; i < 4096; i++)
+            s_att_tab[i] = (i == 0xFFF) ? 0.0f : powf(10.0f, i / (64.0f * -20.0f));
+        s_att_tab[0xFFF] = 0.0f;
+        s_att_tab_ready = 1;
+    }
+    return s_att_tab[v];
 }
 
 /* ============================================================
@@ -1221,7 +1230,7 @@ static void voice_process(MCPXAPUState *d,
                                          NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
     int8_t ps = (int8_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_ENV0,
                                         NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
-    float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
+    float rate = 1.0f / exp2f((p + ps * 32 * ef_value) / 4096.0f);
     dbg->rate = rate;
 
     /* Step amplitude envelope */
@@ -1339,7 +1348,7 @@ static void voice_process(MCPXAPUState *d,
             int16_t fc = (int16_t)voice_get_mask(
                 d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
                 NV_PAVS_VOICE_TAR_FCA_FC0);
-            float fc_f = clampf(powf(2, fc / 4096.0f), 0.003906f, 1.0f);
+            float fc_f = clampf(exp2f(fc / 4096.0f), 0.003906f, 1.0f);
             uint16_t q = (uint16_t)voice_get_mask(
                 d, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
                 NV_PAVS_VOICE_TAR_FCA_FC1);

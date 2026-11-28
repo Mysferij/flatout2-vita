@@ -5,6 +5,20 @@
 #define APU_XAUDIO2_H
 
 #include <stdint.h>
+#include <math.h>
+
+static inline int16_t apu_s16_from_float(float v)
+{
+#if defined(__arm__) && defined(__VFP_FP__)
+    int32_t i;
+    __asm__("vcvt.s32.f32 %0, %1" : "=t"(i) : "t"(v));
+    if (i > 32767) i = 32767;
+    else if (i < -32768) i = -32768;
+    return (int16_t)i;
+#else
+    return (int16_t)lrintf(v);
+#endif
+}
 
 /* Initialize XAudio2. Returns 1 on success, 0 on failure. */
 int xa2_init(void);

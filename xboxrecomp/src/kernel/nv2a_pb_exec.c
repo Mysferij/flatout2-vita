@@ -5077,8 +5077,8 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
                 s_reg_dirty[w >> 4] = 1;
             }
             if (s_vp.const_load < VP_CONSTS)
-                memcpy(&s_vp.c[s_vp.const_load][slot % 4], &p[i], 4);
-            if (slot % 4 == 3)
+                s_vp.c[s_vp.const_load][slot & 3u] = p[i];
+            if ((slot & 3u) == 3)
                 s_vp.const_load++;
         }
         s_vp.gen++;

@@ -26,9 +26,13 @@
  * heard as overdrive. */
 void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling)
 {
-    const float att = 1.0f - expf(-5.0f / APU_LIMITER_LOOKAHEAD);
-    const float rel = 1.0f - expf(-1.0f / (0.120f * 48000.0f));
+    static float att = -1.0f, rel = -1.0f;
     int i, c;
+
+    if (att < 0.0f) {
+        att = 1.0f - expf(-5.0f / APU_LIMITER_LOOKAHEAD);
+        rel = 1.0f - expf(-1.0f / (0.120f * 48000.0f));
+    }
 
     if (!lim->init) {
         memset(lim, 0, sizeof *lim);
@@ -60,7 +64,7 @@ void apu_limiter_run(ApuLimiter *lim, float *lr, int frames, float ceiling)
             d[c] = s[c];
             s[c] = out[c];
         }
-        lim->pos = (lim->pos + 1) % APU_LIMITER_LOOKAHEAD;
+        if (++lim->pos >= APU_LIMITER_LOOKAHEAD) lim->pos = 0;
     }
 }
 
@@ -83,7 +87,7 @@ void apu_output_safety(const int16_t *in, int16_t *out, int n)
             buf[i] = (float)in[done + i] * g_xa2_volume;
         apu_limiter_run(&lim, buf, k / 2, 16384.0f);
         for (i = 0; i < k; i++)
-            out[done + i] = (int16_t)lrintf(buf[i]);
+            out[done + i] = apu_s16_from_float(buf[i]);
     }
 }
 

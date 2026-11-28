@@ -139,11 +139,6 @@ void vita_log(const char *fmt, ...)
         strstr(buf, "[fb] step") || strstr(buf, "[IRQLHOLD]") || strstr(buf, "[apu-step]") || strstr(buf, "[GL] tex_get") || strstr(buf, "[NV2A] DMA_PUT") || strstr(buf, "[KERNEL] summary") || strstr(buf, "[timer]"))
         return;
 
-    if (strstr(buf, "[READ") || strstr(buf, "[ntavm]") || strstr(buf, "[HEAP") ||
-        strstr(buf, "[KERNEL]   ordinal") || strstr(buf, "[GPU]   0x") ||
-        strstr(buf, "[fb] step") || strstr(buf, "[IRQLHOLD]") || strstr(buf, "[apu-step]") || strstr(buf, "[GL] tex_get") || strstr(buf, "[NV2A] DMA_PUT") || strstr(buf, "[KERNEL] summary"))
-        return;
-
     pthread_mutex_lock(&s_log_lock);
     if (lpos + n >= (int)sizeof(lbuf))
         log_drain_locked();
