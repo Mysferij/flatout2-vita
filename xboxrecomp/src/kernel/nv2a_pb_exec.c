@@ -4661,7 +4661,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         nv[0x400100 / 4] &= ~1u;
         nv[0x400108 / 4] = 0;
-        nv[0x000100 / 4] &= ~0x1000u;
         nv[0x400720 / 4] = 1;
         xbox_set_irq_line(3, 0);
         xbox_Nv2aHoldInterrupts(0);
@@ -4888,7 +4887,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                     : s_gpu->flip_read + 1;
                     break;
                 }
-                WaitForSingleObject(driver_event(), 1);
+                DWORD remain = (DWORD)(give_up - GetTickCount64());
+                WaitForSingleObject(driver_event(), remain > 0 ? remain : 1);
             }
         } else {
             /* The stall ends when the buffer being read is the one just

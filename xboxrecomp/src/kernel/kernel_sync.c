@@ -201,6 +201,9 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObject(
 {
     DWORD ms = xbox_nt_timeout_to_ms(Timeout);
     DWORD result;
+    if (ms == 0) {                      /* non-blocking poll: never a safe point */
+        return xbox_wait_result_to_ntstatus(WaitForSingleObjectEx(Handle, 0, Alertable), 1);
+    }
     xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
     xbox_kernel_busy(1);
@@ -223,6 +226,9 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      */
     (void)WaitMode;
 
+    if (ms == 0) {                      /* non-blocking poll: never a safe point */
+        return xbox_wait_result_to_ntstatus(WaitForSingleObjectEx(Handle, 0, Alertable), 1);
+    }
     xbox_kernel_busy(-1);   /* blocked in a wait: a safe point */
     result = WaitForSingleObjectEx(Handle, ms, Alertable);
     xbox_kernel_busy(1);

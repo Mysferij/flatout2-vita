@@ -956,6 +956,7 @@ typedef struct {
     GLuint     prog;
     GLint      u_c, u_surf, u_aa, u_m, u_vpoff, u_xform;
     GLint      u_t[4], u_tscale, u_c0, u_c1, u_fc0, u_fc1, u_fogcolor, u_afunc, u_aref, u_fogp;
+    GLint      u_htex;
     uint32_t   used;
     int        vpc_valid;       /* vpc holds what this program's "c" was given */
     uint32_t   vpc_gen;         /* ... as of the executor's constant version */
@@ -1381,6 +1382,7 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
     p->u_fc1 = glGetUniformLocation(p->prog, "u_fc1");
     p->u_afunc = glGetUniformLocation(p->prog, "u_alpha_func");
     p->u_aref = glGetUniformLocation(p->prog, "u_alpha_ref");
+    p->u_htex = glGetUniformLocation(p->prog, "u_has_tex");
     glUseProgram(p->prog);
     s_cur_prog = p->prog;
     for (i = 0; i < 4; i++) {
@@ -2049,7 +2051,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     uint32_t n, a, i;
     GLintptr idx_at;
     GLenum mode, idx_type = GL_UNSIGNED_INT;
-    float tscale[4][2], c0[8][4], c1[8][4], fog[4], surf[4], aa[2], m[16];
+    float tscale[4][2], c0[8][4], c1[8][4], fog[4], surf[4], aa[2];
 
     if (!ready())
         return;
@@ -2123,7 +2125,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     surf[3] = 0.5f - 0.5f * (float)s->w / (float)s->pw;   /* see nv2a_snap */
     aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
     aa[1] = b->aa_sy > 0 ? b->aa_sy : 1.0f;
-    memcpy(m, b->composite, sizeof m);
 
     /* 192 constants are 3 KB, and most draws in a row share them: upload
      * only when they changed since this program last got them. */
@@ -2160,7 +2161,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         memset(&u, 0, sizeof u);
         memcpy(u.surf, surf, sizeof u.surf);
         memcpy(u.aa, aa, sizeof u.aa);
-        memcpy(u.m, m, sizeof u.m);
+        memcpy(u.m, b->composite, sizeof u.m);
         memcpy(u.vpoff, b->vp_offset, sizeof u.vpoff);
         memcpy(u.tscale, tscale, sizeof u.tscale);
         memcpy(u.c0, c0, sizeof u.c0);
@@ -2197,10 +2198,8 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         }
 #if defined(__vita__)
         {
-            GLint loc_ts0 = glGetUniformLocation(p->prog, "u_tscale0");
-            if (loc_ts0 >= 0) glUniform2fv(loc_ts0, 1, &tscale[0][0]);
-            GLint loc_ht = glGetUniformLocation(p->prog, "u_has_tex");
-            if (loc_ht >= 0) glUniform1i(loc_ht, (r[0x1B0C / 4] & 0x40000000u) ? 1 : 0);
+            if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 1, &tscale[0][0]);
+            if (p->u_htex >= 0) glUniform1i(p->u_htex, (r[0x1B0C / 4] & 0x40000000u) ? 1 : 0);
         }
 #endif
     }
@@ -2303,9 +2302,6 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     glDisable(GL_CULL_FACE);
     if (b->xform != 1) glDisable(GL_DEPTH_TEST);
 #endif
-#if defined(__vita__)
-    if (b->xform != 1) glDisable(GL_CULL_FACE);
-#endif
 
     glBindVertexArray(s_vao);
     if (!upload_vertices(b))
@@ -2337,6 +2333,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     mode = gl_prim(b, &idx, &n);
     if (!n)
         return;
+#if !defined(__vita__)
     {
         /* 16-bit indices whenever the batch's vertices allow: half the bytes
          * through the ring, and the GPU's native index size. */
@@ -2367,6 +2364,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             ring_done(&s_iring, idx_at, (GLsizeiptr)n * 2, dst, idx16);
         }
     }
+#endif
     {
         /* RECOMP_GL_FINISH=1: name each draw before it is submitted and wait
          * for the GPU to finish it. With a synchronous log, the last line

@@ -405,14 +405,6 @@ void sub_00240240(void)
             uint32_t want = MEM32(esp + 4u);
             uint32_t cur = MEM32(sem);
             if ((int32_t)(want - cur) > 0) {
-                struct timespec ts0, ts1;
-                clock_gettime(CLOCK_MONOTONIC, &ts0);
-                (void)ts0; (void)ts1;
-                if ((int32_t)(want - cur) > 2) {
-                    int gd = xbox_gil_suspend();
-                    usleep(1000);
-                    xbox_gil_resume(gd);
-                }
                 if ((int32_t)(want - MEM32(sem)) > 0) {
                     MEM32(sem) = want;
                 }
@@ -703,10 +695,25 @@ typedef struct {
     RecompXmm x4, x5, x6, x7;
 } XmvCoef;
 
+/* Round to nearest even, as rintf does, in one VFP instruction. The Vita
+ * toolchain emits a call to rintf (which then does vcvt) for
+ * __builtin_rintf; this converter made half a million such calls per movie
+ * frame, so the call overhead alone was most of the cost. */
+static inline int32_t xmv_cvt(float f)
+{
+#if defined(__arm__) && defined(__VFP_FP__)
+    int32_t i;
+    __asm__("vcvt.s32.f32 %0, %1" : "=t"(i) : "t"(f));
+    return i;
+#else
+    return (int32_t)__builtin_rintf(f);
+#endif
+}
+
 /* cvtps2pi, psrad 15, packssdw, packuswb: clamp(round(f) >> 15, 0, 255).
  * Out of range cvtps2pi gives 0x80000000, which clamps to 0 (an ARM
  * conversion would saturate instead, hence the explicit check). */
-static inline uint32_t xmv_u8(float f)
+static inline __attribute__((always_inline)) uint32_t xmv_u8(float f)
 {
     int32_t i;
 #if defined(__i386__) || defined(__x86_64__)
@@ -714,13 +721,13 @@ static inline uint32_t xmv_u8(float f)
 #else
     if (!(f >= -2147483648.0f && f < 2147483648.0f))
         return 0;
-    i = (int32_t)__builtin_rintf(f);    /* host rounding is never changed: nearest */
+    i = xmv_cvt(f);                     /* host rounding is never changed: nearest */
 #endif
     i >>= 15;
     return i < 0 ? 0u : i > 255 ? 255u : (uint32_t)i;
 }
 
-static inline RecompMmx xmv_pack(float lo, float hi, RecompMmx m4)
+static inline __attribute__((always_inline)) RecompMmx xmv_pack(float lo, float hi, RecompMmx m4)
 {
     RecompMmx r;
 
@@ -792,7 +799,8 @@ static inline RecompXmm xmv_chroma(RecompXmm x, RecompMmx c)
 __attribute__((optimize("fp-contract=off")))
 static void xmv_yuv_native(void)
 {
-    uint32_t a = esp + 4;                       /* past the return address */
+    RecompRegs *rr = _rr;                        /* cached on the Vita: g_* are macros */
+    uint32_t a = rr->r_esp + 4;                  /* past the return address */
     uint32_t ys = MEM32(a), us = MEM32(a + 4), vs = MEM32(a + 8);
     uint32_t ypitch = MEM32(a + 12), uvpitch = MEM32(a + 16);
     uint32_t dst = MEM32(a + 20), dpitch = MEM32(a + 24);
@@ -804,9 +812,9 @@ static void xmv_yuv_native(void)
 #define FO2_FOLD(x) ((x) - 0xF0000000u < 0x08000000u ? (0x80000000u | ((x) & 0x03FFFFFFu)) : (x))
     dst = FO2_FOLD(dst); ys = FO2_FOLD(ys); us = FO2_FOLD(us); vs = FO2_FOLD(vs);
 #undef FO2_FOLD
-    XmvCoef k = { mm4, mm5, mm7, xmm4, xmm5, xmm6, xmm7 };
-    RecompMmx m6 = mm6, r0 = mm0, r1 = mm1, r2 = mm2, r3 = mm3, u, v;
-    RecompXmm x0 = xmm0, x1 = xmm1, x2 = xmm2, x3 = xmm3;
+    XmvCoef k = { _rr->r_mm[4], _rr->r_mm[5], _rr->r_mm[7], _rr->r_xmm[4], _rr->r_xmm[5], _rr->r_xmm[6], _rr->r_xmm[7] };
+    RecompMmx m6 = _rr->r_mm[6], r0 = _rr->r_mm[0], r1 = _rr->r_mm[1], r2 = _rr->r_mm[2], r3 = _rr->r_mm[3], u, v;
+    RecompXmm x0 = _rr->r_xmm[0], x1 = _rr->r_xmm[1], x2 = _rr->r_xmm[2], x3 = _rr->r_xmm[3];
 
     for (n = 16;;) {
         u = MMX_PUNPCKLBW(MMX_FROM32(xmv_ld32(us)), k.m4);
@@ -1357,6 +1365,17 @@ static int16_t fo2_vita_axis(unsigned char raw, int invert)
     return (int16_t)v;
 }
 
+/* [VITA_PAD] diagnostic spam is off unless FO2X_VITA_PAD_TRACE=1. */
+static int fo2_vita_pad_trace(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("FO2X_VITA_PAD_TRACE");
+        v = e && *e == 49;
+    }
+    return v;
+}
+
 volatile uint32_t g_vita_sdl_buttons = 0u;
 volatile int16_t  g_vita_sdl_axes[4] = { 0, 0, 0, 0 };
 
@@ -1372,7 +1391,7 @@ static void fo2_vita_report(uint8_t out[20])
     if (!sampling_set) {
         int rc_m1 = sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
         int rc_m2 = sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
-        fprintf(stderr, "[VITA_PAD] SamplingMode -> %d, Ext -> %d\n", rc_m1, rc_m2);
+        if (fo2_vita_pad_trace()) fprintf(stderr, "[VITA_PAD] SamplingMode -> %d, Ext -> %d\n", rc_m1, rc_m2);
         fflush(stderr);
         sampling_set = 1;
     }
@@ -1439,7 +1458,7 @@ static void fo2_vita_report(uint8_t out[20])
     {
         static unsigned s_rep_n = 0;
         s_rep_n++;
-        if (s_rep_n == 10u || (s_rep_n % 120u) == 0u) {
+        if ((s_rep_n == 10u || (s_rep_n % 120u) == 0u) && fo2_vita_pad_trace()) {
             fprintf(stderr, "[VITA_PAD] rep #%u rc=%d raw1=0x%08X dig=0x%04X\n",
                     s_rep_n, rc_ctrl, (unsigned)pad.buttons, (unsigned)dig);
             fflush(stderr);
@@ -1762,7 +1781,7 @@ void sub_001EC1B0(void)
     uint32_t self = g_ecx;
     s_c1b0++;
     if (s_c1b0 == 1u || s_c1b0 == 60u) {
-        fprintf(stderr, "[VITA_PAD] sub_001EC1B0 #%u self=0x%08X\n", s_c1b0, (unsigned)self);
+        if (fo2_vita_pad_trace()) fprintf(stderr, "[VITA_PAD] sub_001EC1B0 #%u self=0x%08X\n", s_c1b0, (unsigned)self);
         fflush(stderr);
     }
     if (self >= 0x00100000u && self < 0x04000000u && MEM32(self + 0x140u) == 0u) {

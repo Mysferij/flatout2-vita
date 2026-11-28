@@ -270,38 +270,47 @@ static CRITICAL_SECTION* xbox_cs_shadow(PRTL_CRITICAL_SECTION guest)
     uintptr_t key = (uintptr_t)guest;
     CRITICAL_SECTION* found = NULL;
     size_t home, i;
+    XBOX_CS_SLOT* slot;
+    static XBOX_THREAD_LOCAL uintptr_t t_last_key;
+    static XBOX_THREAD_LOCAL CRITICAL_SECTION* t_last_cs;
 
     if (!key)
         return NULL;
+
+    if (t_last_cs && t_last_key == key)
+        return t_last_cs;
+
     home = (size_t)((key >> 4) % XBOX_CS_TABLE_SIZE);
 
-    /* Shared pass first: after start-up almost every call finds an existing
-     * entry, and taking the table exclusively for each of those would put a
-     * global serialisation point in front of the title's own locks. */
-    AcquireSRWLockShared(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
-        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
-        if (slot->key == 0) break;
+        slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+        uintptr_t k = __atomic_load_n(&slot->key, __ATOMIC_ACQUIRE);
+        if (k == key) { found = &slot->cs; break; }
+        if (k == 0) break;
     }
-    ReleaseSRWLockShared(&g_cs_table_lock);
-    if (found)
+    if (found) {
+        t_last_key = key;
+        t_last_cs = found;
         return found;
+    }
 
     AcquireSRWLockExclusive(&g_cs_table_lock);
     for (i = 0; i < XBOX_CS_TABLE_SIZE; i++) {
-        XBOX_CS_SLOT* slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
-        if (slot->key == key) { found = &slot->cs; break; }
-        if (slot->key == 0) {
+        slot = &g_cs_table[(home + i) % XBOX_CS_TABLE_SIZE];
+        uintptr_t k = __atomic_load_n(&slot->key, __ATOMIC_ACQUIRE);
+        if (k == key) { found = &slot->cs; break; }
+        if (k == 0) {
             InitializeCriticalSection(&slot->cs);
-            slot->key = key;             /* published last: a shared reader
-                                          * that sees the key sees a live
-                                          * lock behind it */
+            __atomic_store_n(&slot->key, key, __ATOMIC_RELEASE);
             found = &slot->cs;
             break;
         }
     }
     ReleaseSRWLockExclusive(&g_cs_table_lock);
+    if (found) {
+        t_last_key = key;
+        t_last_cs = found;
+    }
 
     if (!found && !g_cs_table_full) {
         g_cs_table_full = 1;
@@ -370,6 +379,20 @@ void xbox_SetCrtLockTable(uint32_t table_va, uint32_t count)
 {
     g_crt_lock_table = table_va;
     g_crt_lock_count = count;
+}
+
+/* All [CS] contention reporting (waiting/acquired lines, holder tracking,
+ * enters/leaves counts, guest backtrace) is debug-only and off by default:
+ * on a single-core target the printing plus the 256-word stack scan cost
+ * more than the lock itself. The actual locking is unaffected. */
+static int cs_verbose_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_CS_VERBOSE");
+        v = e && *e == 49;
+    }
+    return v;
 }
 
 static int xbox_crt_lock_index(uint32_t guest_va)
@@ -459,7 +482,10 @@ extern RECOMP_TLS uint32_t g_xbox_kernel_caller;
 
 static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 {
-    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+    XBOX_CS_SLOT* slot;
+    if (!cs_verbose_on())
+        return;
+    slot = xbox_cs_slot_of(cs);
     if (!slot)
         return;
     slot->owner_site = g_xbox_kernel_caller;
@@ -469,7 +495,10 @@ static void xbox_cs_note_owner(CRITICAL_SECTION* cs)
 
 static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
 {
-    XBOX_CS_SLOT* slot = xbox_cs_slot_of(cs);
+    XBOX_CS_SLOT* slot;
+    if (!cs_verbose_on())
+        return;
+    slot = xbox_cs_slot_of(cs);
     if (!slot)
         return;
     if (--slot->depth <= 0) {
@@ -481,15 +510,16 @@ static void xbox_cs_clear_owner(CRITICAL_SECTION* cs)
 VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
+    int verbose;
     if (!cs)
         return;
-    InterlockedIncrement(&g_cs_enters);
+    verbose = cs_verbose_on();
     crt_lock_trace("take", CriticalSection);
     if (TryEnterCriticalSection(cs)) {
-        xbox_cs_note_owner(cs);
+        if (verbose) { InterlockedIncrement(&g_cs_enters); xbox_cs_note_owner(cs); }
         return;
     }
-    if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
+    if (verbose && InterlockedIncrement(&g_cs_contention_reports) <= 16) {
         fprintf(stderr, "  [CS] thread %lu waiting on guest lock 0x%08X"
                         " (held by thread %lu)\n",
                 GetCurrentThreadId(),
@@ -515,17 +545,19 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         }
         fprintf(stderr, "  [CS] enters=%ld leaves=%ld (outstanding %ld)\n",
                 g_cs_enters, g_cs_leaves, g_cs_enters - g_cs_leaves);
-        xbox_guest_backtrace(10);
         fflush(stderr);
     }
     EnterCriticalSection(cs);
-    xbox_cs_note_owner(cs);
-    if (g_cs_contention_reports <= 16) {
-        fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
-                GetCurrentThreadId(),
-                (uint32_t)((uintptr_t)CriticalSection
-                           - (uintptr_t)g_xbox_mem_offset));
-        fflush(stderr);
+    if (verbose) {
+        InterlockedIncrement(&g_cs_enters);
+        xbox_cs_note_owner(cs);
+        if (g_cs_contention_reports <= 16) {
+            fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
+                    GetCurrentThreadId(),
+                    (uint32_t)((uintptr_t)CriticalSection
+                               - (uintptr_t)g_xbox_mem_offset));
+            fflush(stderr);
+        }
     }
 }
 
@@ -533,9 +565,9 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
 {
     CRITICAL_SECTION* cs = xbox_cs_shadow(CriticalSection);
     if (cs) {
-        InterlockedIncrement(&g_cs_leaves);
+        int verbose = cs_verbose_on();
         crt_lock_trace("drop", CriticalSection);
-        xbox_cs_clear_owner(cs);
+        if (verbose) { InterlockedIncrement(&g_cs_leaves); xbox_cs_clear_owner(cs); }
         LeaveCriticalSection(cs);
     }
 }

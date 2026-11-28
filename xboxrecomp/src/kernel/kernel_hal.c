@@ -871,7 +871,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         break;
 
     default:
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+        xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
             "AvSendTVEncoderOption: unknown option 0x%02X", Option);
         *Result = 0;
         break;

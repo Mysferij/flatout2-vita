@@ -833,8 +833,8 @@ static void gil_lock(void)
         if (waits == 0)
             GIL_LOG("lock: step D contended, ticket %llu waits for serving %llu",
                     (unsigned long long)me, (unsigned long long)s_gil_serving);
-        if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, 1))
-            g_gil_contended = 1;           /* 1 ms and still waiting */
+        if (!SleepConditionVariableCS(&s_gil_cv, &s_gil_cs, INFINITE))
+            g_gil_contended = 1;
         if (++waits == 1000 || waits % 60000 == 0)
             GIL_LOG("lock: step D still waiting after %u ms, ticket %llu serving %llu",
                     waits, (unsigned long long)me, (unsigned long long)s_gil_serving);
@@ -866,7 +866,10 @@ static void gil_unlock(void)
     EnterCriticalSection(&s_gil_cs);
     s_gil_owner_tid = 0;
     s_gil_serving++;
-    WakeAllConditionVariable(&s_gil_cv);
+    /* Only broadcast when a ticket is queued: with nobody waiting the next
+     * acquirer simply takes the free lock, no wakeup round-trip needed. */
+    if (s_gil_next - s_gil_serving > 0)
+        WakeAllConditionVariable(&s_gil_cv);
     LeaveCriticalSection(&s_gil_cs);
 }
 
@@ -1070,11 +1073,12 @@ static SRWLOCK g_pending_lock = SRWLOCK_INIT;
  * 5 ms (creator == 0). */
 static void pending_start_flush(DWORD creator)
 {
-    ULONGLONG now = GetTickCount64();
+    ULONGLONG now;
     int i;
 
     if (!g_pending_count)
         return;
+    now = GetTickCount64();
     AcquireSRWLockExclusive(&g_pending_lock);
     for (i = 0; i < PENDING_START_MAX; i++) {
         if (!g_pending_start[i].th)
@@ -2424,12 +2428,14 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+    int gd = xbox_gil_suspend();
 
     if (kdisp_is_guest(object)) {
         HANDLE none = NULL;
         (void)wait_reason; (void)wait_mode; (void)alertable;
         g_eax = (uint32_t)kdisp_wait(1, &object, &none, 0,
                                      kdisp_timeout_ms(timeout_ptr));
+        xbox_gil_resume(gd);
         return;
     }
     h = ke_shadow_lookup(object);
@@ -2439,6 +2445,7 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         h, wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    xbox_gil_resume(gd);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -2453,11 +2460,12 @@ static void bridge_NtWaitForSingleObject(void)
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
+    int gd = xbox_gil_suspend();
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    xbox_gil_resume(gd);
 }
-
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
 /* Resets an event to non-signalled. Halo clears the read-completion event
  * before each async map read; a no-op here left the event stuck signalled. */
@@ -2614,6 +2622,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t wait_mode   = STACK_ARG(3);   /* KernelMode / UserMode */
     uint32_t alertable   = STACK_ARG(4);
     uint32_t timeout_ptr = STACK_ARG(5);
+    int gd = xbox_gil_suspend();
 
     (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
@@ -2621,6 +2630,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
 
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
+        xbox_gil_resume(gd);
         return;
     }
     for (i = 0; i < count; i++)
@@ -2641,6 +2651,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    xbox_gil_resume(gd);
 }
 
 /*
@@ -2782,7 +2793,9 @@ static void bridge_KeBugCheckEx(void)
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
 static void bridge_NtYieldExecution(void)
 {
+    int gd = xbox_gil_suspend();
     g_eax = (uint32_t)xbox_NtYieldExecution();
+    xbox_gil_resume(gd);
 }
 
 /* ── MmGetPhysicalAddress (ordinal 173) ──────────────────── */
@@ -5960,6 +5973,7 @@ static void bridge_KeAlertThread(void)
 static void bridge_KeWaitForMultipleObjects(void)
 {
     uint32_t count      = STACK_ARG(0);
+    int gd = xbox_gil_suspend();
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
@@ -5969,6 +5983,7 @@ static void bridge_KeWaitForMultipleObjects(void)
 
     if (count == 0) {
         g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        xbox_gil_resume(gd);
         return;
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
@@ -5988,6 +6003,7 @@ static void bridge_KeWaitForMultipleObjects(void)
         if (any_guest) {
             g_eax = (uint32_t)kdisp_wait(count, vas, handles, wait_type == 0,
                                          kdisp_timeout_ms(timeout_va));
+            xbox_gil_resume(gd);
             return;
         }
     }
@@ -5997,6 +6013,7 @@ static void bridge_KeWaitForMultipleObjects(void)
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
+    xbox_gil_resume(gd);
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
@@ -10851,9 +10868,20 @@ static int kernel_call_keeps_gil(int slot)
     if (!on || slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE)
         return 0;
     ord = g_slot_ordinals[slot];
-    return ord == 125 || ord == 126 || ord == 127 || ord == 128    /* KeQuery* time */
+    if (ord == 125 || ord == 126 || ord == 127 || ord == 128    /* KeQuery* time */
         || ord == 103 || ord == 129 || ord == 130                    /* KeGetCurrentIrql, */
-        || ord == 160 || ord == 161;          /* KeRaiseIrqlTo*, KfRaise/LowerIrql */
+        || ord == 160 || ord == 161)          /* KeRaiseIrqlTo*, KfRaise/LowerIrql */
+        return 1;
+    /* A non-blocking NtWaitForSingleObject(Ex) (timeout 0) returns at once;
+     * handing the guest lock over and taking it back is pure overhead.
+     * g_esp still points at the dummy return address; args follow. */
+    if (ord == 233 || ord == 234) {
+        uint32_t tp_off = (ord == 233) ? 12u : 16u;
+        uint32_t tp = BRIDGE_MEM32(g_esp + tp_off);
+        if (tp && BRIDGE_MEM32(tp) == 0 && BRIDGE_MEM32(tp + 4) == 0)
+            return 1;
+    }
+    return 0;
 }
 
 static void kernel_thunk_dispatch(void)
@@ -10868,15 +10896,6 @@ static void kernel_thunk_dispatch(void)
      * no ResumeThread after it). The flush takes no GIL (it only calls
      * ResumeThread), so it is safe on this path too. */
     pending_start_flush(GetCurrentThreadId());
-#if defined(__vita__)
-    {
-        static unsigned s_wscan_div = 0;
-        if ((++s_wscan_div & 63u) == 0u) {
-            extern void vita_susp_watch_scan(void);
-            vita_susp_watch_scan();
-        }
-    }
-#endif
     if (kernel_call_keeps_gil(g_kernel_dispatch_slot)) {
         KDISP_LOG("dispatch: keeps GIL, body");
         kernel_thunk_dispatch_body();
@@ -10936,12 +10955,11 @@ static void kernel_thunk_dispatch_body(void)
          * Фоновый log_flusher (500 мс) сбросит буфер. */
     }
 
-    {
+    if (!xbox_log_quiet()) {
         static DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200
-                && !xbox_log_quiet()) {
+        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
@@ -11088,7 +11106,6 @@ static void kernel_thunk_dispatch_body(void)
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
-        fflush(stderr);
     }
 }
 
