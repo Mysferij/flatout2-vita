@@ -1509,7 +1509,47 @@ void sub_001EB940(void)
 }
 
 static uint16_t g_vita_cur_btn = 0u;
-static uint16_t g_vita_edge_btn = 0u;
+
+static uint16_t fo2_vita_buttons_from_report(const uint8_t rep[20])
+{
+    uint16_t wbtn, cur = 0u;
+
+    wbtn = (uint16_t)rep[2] | ((uint16_t)rep[3] << 8);
+    if (rep[4] > 0x1Eu) cur |= (1u << 0);
+    if (rep[5] > 0x1Eu) cur |= (1u << 1);
+    if (rep[6] > 0x1Eu) cur |= (1u << 2);
+    if (rep[7] > 0x1Eu) cur |= (1u << 3);
+    if (wbtn & 0x0010u) cur |= (1u << 8);
+    if (wbtn & 0x0020u) cur |= (1u << 9);
+    if (wbtn & 0x0001u) cur |= (1u << 10);
+    if (wbtn & 0x0002u) cur |= (1u << 11);
+    if (wbtn & 0x0004u) cur |= (1u << 12);
+    if (wbtn & 0x0008u) cur |= (1u << 13);
+    return cur;
+}
+
+static void fo2_vita_write_pad_slots(uint32_t self, uint16_t cur, uint16_t edge)
+{
+    uint32_t idx;
+
+    MEM8(self + 0x130u) = 1u;
+    for (uint32_t act = 0u; act < 20u; act++) {
+        if (MEM8(self + 0x78Cu + act) == 0xFFu)
+            MEM8(self + 0x78Cu + act) = (uint8_t)act;
+    }
+    for (idx = 0u; idx < 20u; idx++) {
+        uint32_t base = self + idx * 20u + 0x7ECu;
+        uint32_t bit = (idx < 14u) ? (1u << idx) : ((1u << 0) | (1u << 8));
+        if (edge & bit) MEM8(base) = 1u;
+        MEM32(base + 4u) = (cur & bit) ? 1u : 0u;
+    }
+    if (cur & ((1u << 8) | (1u << 0))) {
+        MEM32(self + 0x7B4u) = 1u;
+        MEM32(self + 0x7C4u) = 1u;
+        MEM32(self + 0x7B8u) = 1u;
+        MEM32(self + 0x7C8u) = 1u;
+    }
+}
 
 static void fo2_vita_sync_pad_slots(uint32_t self, uint32_t arg_idx)
 {
@@ -1517,40 +1557,12 @@ static void fo2_vita_sync_pad_slots(uint32_t self, uint32_t arg_idx)
     (void)arg_idx;
     if (self >= 0x00100000u && self < 0x04000000u && MEM32(self + 0x140u) < 4u) {
         uint8_t rep[20];
+        uint16_t cur, edge;
         fo2_vita_report(rep);
-        uint16_t wbtn = (uint16_t)rep[2] | ((uint16_t)rep[3] << 8);
-        uint16_t cur = 0u;
-        if (rep[4] > 0x1Eu) cur |= (1u << 0);  /* 0: A / Cross */
-        if (rep[5] > 0x1Eu) cur |= (1u << 1);  /* 1: B / Circle */
-        if (rep[6] > 0x1Eu) cur |= (1u << 2);  /* 2: X / Square */
-        if (rep[7] > 0x1Eu) cur |= (1u << 3);  /* 3: Y / Triangle */
-        if (wbtn & 0x0010u) cur |= (1u << 8);  /* 8: Start */
-        if (wbtn & 0x0020u) cur |= (1u << 9);  /* 9: Select */
-        if (wbtn & 0x0001u) cur |= (1u << 10); /* 10: Up */
-        if (wbtn & 0x0002u) cur |= (1u << 11); /* 11: Down */
-        if (wbtn & 0x0004u) cur |= (1u << 12); /* 12: Left */
-        if (wbtn & 0x0008u) cur |= (1u << 13); /* 13: Right */
-        uint16_t new_edge = (uint16_t)(cur & ~g_vita_cur_btn);
-        if (new_edge) g_vita_edge_btn |= new_edge;
+        cur = fo2_vita_buttons_from_report(rep);
+        edge = (uint16_t)(cur & ~g_vita_cur_btn);
         g_vita_cur_btn = cur;
-
-        MEM8(self + 0x130u) = 1u;
-        for (uint32_t act = 0u; act < 20u; act++) {
-            if (MEM8(self + 0x78Cu + act) == 0xFFu)
-                MEM8(self + 0x78Cu + act) = (uint8_t)act;
-        }
-        for (uint32_t idx = 0u; idx < 20u; idx++) {
-            uint32_t base = self + idx * 20u + 0x7ECu;
-            uint32_t bit = (idx < 14u) ? (1u << idx) : ((1u << 0) | (1u << 8));
-            if (g_vita_edge_btn & bit) MEM8(base) = 1u;
-            MEM32(base + 4u) = (cur & bit) ? 1u : 0u;
-        }
-        if (cur & ((1u << 8) | (1u << 0))) {
-            MEM32(self + 0x7B4u) = 1u;
-            MEM32(self + 0x7C4u) = 1u;
-            MEM32(self + 0x7B8u) = 1u;
-            MEM32(self + 0x7C8u) = 1u;
-        }
+        fo2_vita_write_pad_slots(self, cur, edge);
     }
 #else
     (void)self; (void)arg_idx;
@@ -1610,39 +1622,16 @@ void fo2_vita_frame_tick(void)
 #if defined(__vita__)
     static unsigned s_ftick = 0u;
     s_ftick++;
-    static uint16_t s_prev_frame_btn = 0u;
     uint8_t rep[20];
     fo2_vita_report(rep);
-    uint16_t wbtn = (uint16_t)rep[2] | ((uint16_t)rep[3] << 8);
-    uint16_t cur = 0u;
-    if (rep[4] > 0x1Eu) cur |= (1u << 0);  /* 0: A / Cross */
-    if (rep[5] > 0x1Eu) cur |= (1u << 1);  /* 1: B / Circle */
-    if (rep[6] > 0x1Eu) cur |= (1u << 2);  /* 2: X / Square */
-    if (rep[7] > 0x1Eu) cur |= (1u << 3);  /* 3: Y / Triangle */
-    if (wbtn & 0x0010u) cur |= (1u << 8);  /* 8: Start */
-    if (wbtn & 0x0020u) cur |= (1u << 9);  /* 9: Select */
-    if (wbtn & 0x0001u) cur |= (1u << 10); /* 10: Up */
-    if (wbtn & 0x0002u) cur |= (1u << 11); /* 11: Down */
-    if (wbtn & 0x0004u) cur |= (1u << 12); /* 12: Left */
-    if (wbtn & 0x0008u) cur |= (1u << 13); /* 13: Right */
-    if (cur != s_prev_frame_btn) {
-        fprintf(stderr, "[VITA_FRAME_PAD] cur=0x%04X (ctrl0=0x%08X)\n", (unsigned)cur, (unsigned)s_ctrl_objs[0]);
-        if (cur != 0u) {
-            fprintf(stderr, "[VITA_STACK]");
-            int printed = 0;
-            for (uint32_t sp = 0x01CA0D00u; sp < 0x01CA1200u && printed < 16; sp += 4u) {
-                uint32_t val = MEM32(sp);
-                if (val >= 0x00011000u && val < 0x00310000u) {
-                    fprintf(stderr, " %08X", (unsigned)val);
-                    printed++;
-                }
-            }
-            fprintf(stderr, "\n");
-        }
+    uint16_t cur = fo2_vita_buttons_from_report(rep);
+    uint16_t edge = (uint16_t)(cur & ~g_vita_cur_btn);
+    g_vita_cur_btn = cur;
+    if (edge) {
+        fprintf(stderr, "[VITA_FRAME_PAD] cur=0x%04X edge=0x%04X (ctrl0=0x%08X)\n",
+                (unsigned)cur, (unsigned)edge, (unsigned)s_ctrl_objs[0]);
         fflush(stderr);
     }
-    uint16_t edge = (uint16_t)(cur & ~s_prev_frame_btn);
-    s_prev_frame_btn = cur;
 
     if (s_ctrl_objs[0] == 0u) {
         for (uint32_t va = 0x01400000u; va < 0x01700000u; va += 4u) {
@@ -1656,29 +1645,11 @@ void fo2_vita_frame_tick(void)
         uint32_t self = s_ctrl_objs[p];
         if (self < 0x00100000u || self >= 0x04000000u) continue;
         MEM32(self + 0x12Cu) = 1u;
-        MEM8(self + 0x130u) = 1u;
         MEM32(self + 0x9B2u) = MEM32(self + 0x9B2u) + 1u;
         for (uint32_t b = 0u; b < 16u; b++)
             MEM8(self + 0x9B6u + b) = rep[2u + b];
-        for (uint32_t act = 0u; act < 20u; act++) {
-            if (MEM8(self + 0x78Cu + act) == 0xFFu)
-                MEM8(self + 0x78Cu + act) = (uint8_t)act;
-        }
-        for (uint32_t idx = 0u; idx < 20u; idx++) {
-            uint32_t base = self + idx * 20u + 0x7ECu;
-            uint32_t bit = (idx < 14u) ? (1u << idx) : ((1u << 0) | (1u << 8));
-            if (edge & bit) MEM8(base) = 1u;
-            MEM32(base + 4u) = (cur & bit) ? 1u : 0u;
-        }
-        if (cur & ((1u << 8) | (1u << 0))) {
-            MEM32(self + 0x7B4u) = 1u;
-            MEM32(self + 0x7C4u) = 1u;
-            MEM32(self + 0x7B8u) = 1u;
-            MEM32(self + 0x7C8u) = 1u;
-        }
+        fo2_vita_write_pad_slots(self, cur, edge);
     }
-    g_vita_edge_btn = edge;
-    g_vita_cur_btn = cur;
 #endif
 }
 

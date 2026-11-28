@@ -274,15 +274,26 @@ void xbox_InputInit(void)
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
+    SceCtrlData buf[64];
     SceCtrlData pad;
     WORD btn = 0;
+    int n, i;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
     if (dwPort != 0)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    memset(&pad, 0, sizeof(pad));
-    sceCtrlPeekBufferPositive(0, &pad, 1);
+    memset(buf, 0, sizeof buf);
+    n = sceCtrlPeekBufferPositive(0, buf, 64);
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    memset(&pad, 0, sizeof pad);
+    for (i = 0; i < n; i++)
+        pad.buttons |= buf[i].buttons;
+    pad.lx = buf[n - 1].lx;
+    pad.ly = buf[n - 1].ly;
+    pad.rx = buf[n - 1].rx;
+    pad.ry = buf[n - 1].ry;
     g_controller_connected[0] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));

@@ -2149,12 +2149,14 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (hz_on() && s_hz_texs != texs)
             s_hz_tex_ns += hz_now() - t0;
     }
-    for (i = 0; i < 8; i++) {
-        argb_vec4(r[0xA60 / 4 + i], c0[i]);
-        argb_vec4(r[0xA80 / 4 + i], c1[i]);
+    if (p->u_c0 >= 0 || p->u_c1 >= 0) {
+        for (i = 0; i < 8; i++) {
+            argb_vec4(r[0xA60 / 4 + i], c0[i]);
+            argb_vec4(r[0xA80 / 4 + i], c1[i]);
+        }
     }
-    {
-        uint32_t fc = r[0x2A8 / 4];            /* R in the low byte */
+    if (p->u_fogcolor >= 0) {
+        uint32_t fc = r[0x2A8 / 4];
         fog[0] = byte_f(fc, 0); fog[1] = byte_f(fc, 8);
         fog[2] = byte_f(fc, 16); fog[3] = byte_f(fc, 24);
     }
@@ -2198,20 +2200,22 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
          * program already holds. */
         struct GlUni u;
         memset(&u, 0, sizeof u);
-        memcpy(u.surf, surf, sizeof u.surf);
-        memcpy(u.aa, aa, sizeof u.aa);
-        memcpy(u.m, b->composite, sizeof u.m);
-        memcpy(u.vpoff, b->vp_offset, sizeof u.vpoff);
-        memcpy(u.tscale, tscale, sizeof u.tscale);
-        memcpy(u.c0, c0, sizeof u.c0);
-        memcpy(u.c1, c1, sizeof u.c1);
-        memcpy(u.fog, fog, sizeof u.fog);
-        argb_vec4(r[0x1E20 / 4], u.fc[0]);      /* SPECULAR_FOG_FACTOR0/1 */
-        argb_vec4(r[0x1E24 / 4], u.fc[1]);
-        u.aref = (float)(r[0x340 / 4] & 0xFF);
-        nv2a_fog_params(r, b->xform, u.fogp);
-        u.xform = b->xform == 1 ? 1 : 0;
-        u.afunc = r[0x300 / 4] ? (GLint)r[0x33C / 4] : 0x207;
+        if (p->u_surf >= 0) memcpy(u.surf, surf, sizeof u.surf);
+        if (p->u_aa >= 0) memcpy(u.aa, aa, sizeof u.aa);
+        if (p->u_m >= 0) memcpy(u.m, b->composite, sizeof u.m);
+        if (p->u_vpoff >= 0) memcpy(u.vpoff, b->vp_offset, sizeof u.vpoff);
+#if !defined(__vita__)
+        if (p->u_tscale >= 0) memcpy(u.tscale, tscale, sizeof u.tscale);
+#endif
+        if (p->u_c0 >= 0) memcpy(u.c0, c0, sizeof u.c0);
+        if (p->u_c1 >= 0) memcpy(u.c1, c1, sizeof u.c1);
+        if (p->u_fogcolor >= 0) memcpy(u.fog, fog, sizeof u.fog);
+        if (p->u_fc0 >= 0) argb_vec4(r[0x1E20 / 4], u.fc[0]);
+        if (p->u_fc1 >= 0) argb_vec4(r[0x1E24 / 4], u.fc[1]);
+        if (p->u_aref >= 0) u.aref = (float)(r[0x340 / 4] & 0xFF);
+        if (p->u_fogp >= 0) nv2a_fog_params(r, b->xform, u.fogp);
+        if (p->u_xform >= 0) u.xform = b->xform == 1 ? 1 : 0;
+        if (p->u_afunc >= 0) u.afunc = r[0x300 / 4] ? (GLint)r[0x33C / 4] : 0x207;
         if (!p->uni_valid || memcmp(&u, &p->uni, sizeof u) != 0) {
             p->uni = u;
             p->uni_valid = 1;
@@ -2220,10 +2224,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             if (p->u_m >= 0) glUniform4fv(p->u_m, 4, u.m);
             if (p->u_vpoff >= 0) glUniform4fv(p->u_vpoff, 1, u.vpoff);
             if (p->u_xform >= 0) glUniform1i(p->u_xform, u.xform);
-            #if defined(__vita__)
-            if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 1, &u.tscale[0][0]);
-
-#else
+#if !defined(__vita__)
             if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 4, &u.tscale[0][0]);
 #endif
             if (p->u_c0 >= 0) glUniform4fv(p->u_c0, 8, &u.c0[0][0]);
@@ -2481,6 +2482,7 @@ static void gl_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     s = surf_bind(sf, rs ? rs->zeta_va : 0);
     if (!s)
         return;
+    s_drew_any = 1;
     glDisable(GL_SCISSOR_TEST);
     if (s_regs) {
         uint32_t hz = s_regs[0x1D98 / 4], vt = s_regs[0x1D9C / 4];
@@ -2630,12 +2632,7 @@ static void gl_flip(void)
             if (dump_every <= 0) dump_every = 60;
         }
     }
-    if (!s || !s_drew_any) {
-        /* Nothing to show yet -- no surface, or only cleared ones (a title
-         * clears to black long before its first frame): the host's
-         * placeholder (a loading screen), or
-         * at least a clear -- a buffer never drawn to reaches the screen as
-         * whatever the driver left in it. */
+    if (!s || s->used != s_frame - 1u || !s->tex) {
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDisable(GL_SCISSOR_TEST);
         glColorMask(1, 1, 1, 1);
@@ -2673,12 +2670,6 @@ static void gl_flip(void)
      * creation size). */
 #if defined(__vita__)
     ww = 960; wh = 544;
-    for (int si = 0; si < GL_MAX_SURF; si++) {
-        if (s_surf[si].tex && s_surf[si].w >= 1280 && s_surf[si].h >= 480) {
-            s = &s_surf[si];
-            break;
-        }
-    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, 960, 544);
     glDisable(GL_SCISSOR_TEST);
@@ -2687,8 +2678,7 @@ static void gl_flip(void)
     glDisable(GL_BLEND);
     glColorMask(1, 1, 1, 1);
     glClearColor(0, 0, 0, 1);
-    if (!s || !s->tex)
-        glClear(GL_COLOR_BUFFER_BIT);
+    glClear(GL_COLOR_BUFFER_BIT);
     if (s && s->tex) {
         static GLuint pprog = 0;
         if (!pprog) {

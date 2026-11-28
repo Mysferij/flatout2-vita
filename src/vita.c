@@ -122,6 +122,12 @@ static void log_drain(void)
 void vita_log(const char *fmt, ...)
 {
     if (s_no_log) return;
+    if (strstr(fmt, "[READ") || strstr(fmt, "[ntavm]") || strstr(fmt, "[HEAP") ||
+        strstr(fmt, "[KERNEL]   ordinal") || strstr(fmt, "[GPU]   0x") ||
+        strstr(fmt, "[fb] step") || strstr(fmt, "[IRQLHOLD]") || strstr(fmt, "[apu-step]") ||
+        strstr(fmt, "[GL] tex_get") || strstr(fmt, "[NV2A] DMA_PUT") ||
+        strstr(fmt, "[KERNEL] summary") || strstr(fmt, "[timer]"))
+        return;
     char buf[768];
     va_list ap;
     int n;
