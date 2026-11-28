@@ -35,6 +35,7 @@ int xbox_log_quiet(void);                   /* kernel_bridge.c */
  *                                    0.5..4, default 1)
  *   RECOMP_GL_SHARED_Z=0             depth buffer per colour surface instead of
  *                                    per zeta address (the old behaviour)
+ *   FO2_GL_BATCH=0                   (Vita) disable 2D/UI quad batching
  */
 #include "nv2a_gl.h"
 #include "gl_api.h"
@@ -116,6 +117,26 @@ static int hz_on(void)
 }
 static GLuint        s_cur_prog;         /* what glUseProgram last got */
 static void state_dirty(void);
+/* The draw framebuffer and viewport almost never change between the quads of
+ * a text overlay, but rebinding them went through vitaGL every single draw. */
+static GLuint s_cur_fbo = (GLuint)-1;
+static GLint  s_cur_vp_w = -1, s_cur_vp_h = -1;
+static void fbo_bind(GLuint fbo)
+{
+    if (s_cur_fbo != fbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        s_cur_fbo = fbo;
+    }
+}
+static void viewport_set(GLsizei w, GLsizei h)
+{
+    if (s_cur_vp_w != w || s_cur_vp_h != h) {
+        glViewport(0, 0, w, h);
+        s_cur_vp_w = (GLint)w;
+        s_cur_vp_h = (GLint)h;
+    }
+}
+
 /* Last sampler state set on a GL texture (bind_stage). */
 typedef struct { GLuint id; uint32_t key; } TexParam;
 #define TEX_PARAM_SLOTS 4096
@@ -132,7 +153,28 @@ static void tex_param_forget(GLuint id)
 static int    s_active_unit = -1;
 static GLuint s_bound[4];
 static int    s_bound_known;
-static void tex_bind_forget(void) { s_active_unit = -1; s_bound_known = 0; }
+/* A run of glyphs programs the same four stages over and over. Remember the
+ * method-shadow words and the resolved addresses so the hash lookup, the
+ * format decode and the bind calls run once per run, not once per glyph.
+ * The frame number and a generation bumped by tex_bind_forget keep a texture
+ * update or an eviction from being missed. */
+#if defined(__vita__)
+typedef struct {
+    uint32_t w[9], tex, pal, frame, gen;
+} StageKey;
+static StageKey s_stage_key[4];
+static float    s_stage_ts[4][2];
+static uint8_t  s_stage_have[4];
+static uint32_t s_stage_gen;
+#endif
+static void tex_bind_forget(void)
+{
+    s_active_unit = -1;
+    s_bound_known = 0;
+#if defined(__vita__)
+    s_stage_gen++;
+#endif
+}
 static void active_unit(int i)
 {
     if (s_active_unit != i) {
@@ -203,6 +245,17 @@ static int     s_drew_any;              /* the title has drawn something */
 
 static int s_watch_hit;
 
+static GlSurf *surf_find(uint32_t va);
+
+/* Every draw of a text overlay targets the same surface. Check the one used
+ * by the previous draw before walking the 32 slots. */
+static GlSurf *surf_find_fast(uint32_t va)
+{
+    if (s_last && s_last->fbo && s_last->va == va)
+        return s_last;
+    return surf_find(va);
+}
+
 #if defined(__vita__)
 static uint32_t vita_next_pow2(uint32_t v);
 #endif
@@ -218,7 +271,7 @@ static GlSurf *surf_find(uint32_t va)
 static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
                         uint32_t aa_sx, uint32_t aa_sy)
 {
-    GlSurf *s = surf_find(va), *victim = NULL;
+    GlSurf *s = surf_find_fast(va), *victim = NULL;
     int i;
 
     /* h is the surface clip, not the allocation: NFSU2's split screen clips
@@ -272,7 +325,7 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     glBindRenderbuffer(GL_RENDERBUFFER, s->ds);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)s->pw, (GLsizei)s->ph);
     glGenFramebuffers(1, &s->fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+    fbo_bind(s->fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
                               GL_RENDERBUFFER, s->ds);
@@ -280,9 +333,9 @@ static GlSurf *surf_get(uint32_t va, uint32_t w, uint32_t h,
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
         fprintf(stderr, "  [GL] surface 0x%08X %ux%u incomplete\n", va, s->pw, s->ph);
 #if defined(__vita__)
-    glViewport(0, 0, (GLsizei)s->w, (GLsizei)s->h);
+    viewport_set((GLsizei)s->w, (GLsizei)s->h);
 #else
-    glViewport(0, 0, (GLsizei)s->pw, (GLsizei)s->ph);
+    viewport_set((GLsizei)s->pw, (GLsizei)s->ph);
 #endif
     glClearColor(0, 0, 0, 1);
     glClearDepth(1.0);
@@ -346,7 +399,7 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
         return NULL;
     s = surf_get(sf->color_va, w, h, sf->aa_sx ? sf->aa_sx : 1,
                  sf->aa_sy ? sf->aa_sy : 1);
-    glBindFramebuffer(GL_FRAMEBUFFER, s->fbo);
+    fbo_bind(s->fbo);
     if (s_shared_z < 0) {
         const char *e = getenv("RECOMP_GL_SHARED_Z");
         s_shared_z = !(e && e[0] == '0');
@@ -367,9 +420,9 @@ static GlSurf *surf_bind(const Nv2aSurface *sf, uint32_t zeta_va)
         glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     }
 #if defined(__vita__)
-    glViewport(0, 0, (GLsizei)s->w, (GLsizei)s->h);
+    viewport_set((GLsizei)s->w, (GLsizei)s->h);
 #else
-    glViewport(0, 0, (GLsizei)s->pw, (GLsizei)s->ph);
+    viewport_set((GLsizei)s->pw, (GLsizei)s->ph);
 #endif
     s_last = s;
     return s;
@@ -897,7 +950,7 @@ static void rt_scale(uint32_t w, uint32_t h, uint32_t sw, uint32_t sh,
 }
 
 /* Bind stage `i` from the method shadow; returns the texcoord scale. */
-static void bind_stage(const uint32_t *regs, int i, float scale[2])
+static void bind_stage_real(const uint32_t *regs, int i, float scale[2])
 {
     uint32_t base = (0x1B00u + (uint32_t)i * 0x40u) / 4;
     uint32_t control0 = regs[base + 3];
@@ -936,7 +989,7 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
     }
     s_palette_reg = regs[base + 8];          /* SET_TEXTURE_PALETTE */
     s_palette_va = s_batch->pal_va[i];
-    rt = surf_find(va);
+    rt = surf_find_fast(va);
     if (rt) {
         tex = rt->tex;
         /* The image the title samples is the logical one; the FBO holds it
@@ -976,6 +1029,35 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2])
     }
 }
 
+/* Skip the whole stage for a run of glyphs with unchanged stage state. */
+static void bind_stage(const uint32_t *regs, int i, float scale[2])
+{
+#if defined(__vita__)
+    uint32_t base = (0x1B00u + (uint32_t)i * 0x40u) / 4;
+    StageKey k;
+    int j;
+
+    for (j = 0; j < 9; j++)
+        k.w[j] = regs[base + j];
+    k.tex = s_batch ? s_batch->tex_va[i] : 0;
+    k.pal = s_batch ? s_batch->pal_va[i] : 0;
+    k.frame = s_frame;
+    k.gen = s_stage_gen;
+    if (s_stage_have[i] && !memcmp(&s_stage_key[i], &k, sizeof k)) {
+        scale[0] = s_stage_ts[i][0];
+        scale[1] = s_stage_ts[i][1];
+        return;
+    }
+#endif
+    bind_stage_real(regs, i, scale);
+#if defined(__vita__)
+    s_stage_key[i] = k;
+    s_stage_ts[i][0] = scale[0];
+    s_stage_ts[i][1] = scale[1];
+    s_stage_have[i] = 1;
+#endif
+}
+
 /* ── Programs ─────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -997,6 +1079,10 @@ typedef struct {
         float surf[4], aa[2], m[16], vpoff[4], tscale[4][2];
         float c0[8][4], c1[8][4], fog[4], fc[2][4], aref, fogp[4];
         int   xform, afunc;
+#if defined(__vita__)
+        float tscale0[2];                   /* the Vita fallback shader */
+        int   has_tex;
+#endif
     } uni;
 } GlProg;
 
@@ -1221,6 +1307,12 @@ static void prog_cache_prewarm(void)
             bad ? " (file ends in a bad record)" : "");
 }
 
+#if defined(__vita__)
+/* Every Vita draw uses the one fallback program; skip the key hash and the
+ * program-table walk entirely after its first successful lookup. */
+static GlProg *s_vita_prog;
+#endif
+
 static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 {
     static uint32_t last_gen;
@@ -1244,6 +1336,12 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
         }
         vkey = last_vkey;
     }
+#if defined(__vita__)
+    if (s_vita_prog && s_vita_prog->prog) {
+        s_vita_prog->used = s_frame;
+        return s_vita_prog;
+    }
+#endif
     /* Runs of draws share their program. */
     if (last && last->prog && last->vkey == vkey && !memcmp(&last->pkey, pk, sizeof *pk)) {
         last->used = s_frame;
@@ -1339,6 +1437,7 @@ static GlProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
             }
         }
         p->prog = vita_fallback_program();
+        if (p->prog) s_vita_prog = p;
         if (0) {
             p->prog = 0;
             if (!p->prog) return NULL;
@@ -1595,7 +1694,13 @@ typedef struct {
 static GlState s_st;
 static int s_st_valid;
 
-static void state_dirty(void) { s_st_valid = 0; tex_bind_forget(); }
+static void state_dirty(void)
+{
+    s_st_valid = 0;
+    s_cur_fbo = (GLuint)-1;
+    s_cur_vp_w = s_cur_vp_h = -1;
+    tex_bind_forget();
+}
 
 /* SET_SURFACE_CLIP as a scissor in s's stored pixels (sc[2] = 0: the clip
  * covers the surface). NFSU2's split screen draws each player's world with
@@ -1618,7 +1723,7 @@ static void surface_scissor(const uint32_t *r, const GlSurf *s, GLint sc[4])
     sc[3] = to_stored(y1, s->ph, s->h) - sc[1];
 }
 
-static void apply_state(const uint32_t *r, int has_depth, const GlSurf *s)
+static void apply_state(const uint32_t *r, int has_depth, const GlSurf *s, int xform)
 {
     uint32_t cm = r[0x358 / 4];
     GlState want;
@@ -1642,6 +1747,15 @@ static void apply_state(const uint32_t *r, int has_depth, const GlSurf *s)
         want.cull = 1; want.cullface = r[0x39C / 4]; want.front = r[0x3A0 / 4];
     }
     want.cm = cm;
+#if defined(__vita__)
+    /* The fallback shader does not cull and cannot clip against Z for
+     * pre-transformed quads. Fold that into the cached state instead of
+     * issuing two unconditional glDisable calls after every apply_state. */
+    want.cull = 0;
+    if (xform != 1) want.depth = 0;
+#else
+    (void)xform;
+#endif
     if (s_st_valid && !memcmp(&want, &s_st, sizeof want))
         return;
     s_st = want;
@@ -1889,90 +2003,127 @@ static uint32_t vertex_runs(const Nv2aRawBatch *b, VRun *run, int *of_run)
     return nrun;
 }
 
-static int upload_vertices(const Nv2aRawBatch *b)
-{
 #if defined(__vita__)
-    static GLuint vbo[3];
-    static float *buf[3];
-    static size_t cap;
-    uint32_t nv = b->vertex_count, v;
-    if (!nv) return 0;
-    if (!vbo[0]) glGenBuffers(3, vbo);
-    if (nv > cap) {
-        cap = nv + 2048;
-        for (int k = 0; k < 3; k++) {
-            free(buf[k]);
-            buf[k] = (float *)malloc(cap * 4 * sizeof(float));
+/* Client-side attribute arrays on the Vita. All three attributes live in one
+ * interleaved 48-byte vertex, and a pointer is only re-specified when its
+ * address actually changes (buffer growth, the present blit, or switching
+ * between this buffer and the UI batch). vitaGL copies client memory when the
+ * draw is submitted, so the contents may change without touching the pointer. */
+static float *s_vbuf;
+static size_t s_vcap;
+static const void *s_attr_p[3];
+static int s_abuf_bound = -1, s_ebuf_bound = -1;
+
+static void client_array_buffer(void)
+{
+    if (s_abuf_bound != 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        s_abuf_bound = 0;
+    }
+}
+
+static void client_element_buffer(void)
+{
+    if (s_ebuf_bound != 0) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        s_ebuf_bound = 0;
+    }
+}
+
+static void vita_attr_bind(const float *v)
+{
+    const GLsizei stride = 12 * (GLsizei)sizeof(float);
+    int k;
+
+    client_array_buffer();
+    for (k = 0; k < 3; k++) {
+        const void *p = v + k * 4;
+        attr_enable((uint32_t)k, 1);
+        if (s_attr_p[k] != p) {
+            glVertexAttribPointer((GLuint)k, 4, GL_FLOAT, GL_FALSE, stride, p);
+            s_attr_p[k] = p;
         }
     }
-    if (!buf[0] || !buf[1] || !buf[2]) return 0;
+}
 
-    int uv_slot = (b->attr_present & (1u << 9)) ? 9 : ((b->attr_present & (1u << 3) && b->direct[3].type != 0) ? 3 : -1);
-    int col_slot = (b->attr_present & (1u << 2)) ? 2 : ((b->attr_present & (1u << 3) && b->direct[3].type == 0) ? 3 : -1);
+static void vita_attr_forget(void)
+{
+    s_attr_p[0] = s_attr_p[1] = s_attr_p[2] = NULL;
+}
+#endif
+
+static int upload_vertices(const Nv2aRawBatch *b, float *out)
+{
+#if defined(__vita__)
+    uint32_t nv = b->vertex_count, v;
+    float *dst;
+    int uv_slot, col_slot;
+
+    if (!nv) return 0;
+    if (!s_vbuf || nv > s_vcap) {
+        float *nb = (float *)realloc(s_vbuf, (size_t)(nv + 2048) * 12 * sizeof(float));
+        if (!nb) return 0;
+        s_vbuf = nb;
+        s_vcap = nv + 2048;
+    }
+    if (!s_byte_f_ready)                    /* build the LUT once, not per byte */
+        (void)byte_f(0, 0);
+    dst = out ? out : s_vbuf;
+
+    uv_slot = (b->attr_present & (1u << 9)) ? 9
+            : ((b->attr_present & (1u << 3) && b->direct[3].type != 0) ? 3 : -1);
+    col_slot = (b->attr_present & (1u << 2)) ? 2
+             : ((b->attr_present & (1u << 3) && b->direct[3].type == 0) ? 3 : -1);
 
     for (v = 0; v < nv; v++) {
-        /* 0: Position */
+        float *p4 = dst + (size_t)v * 12;
+        float *c4 = p4 + 4;
+        float *t4 = p4 + 8;
+
+        /* 0: position */
+        p4[0] = p4[1] = p4[2] = 0.0f; p4[3] = 1.0f;
         if ((b->attr_direct & 1u) && b->direct[0].ptr) {
             const uint8_t *src = b->direct[0].ptr + (size_t)v * b->direct[0].stride;
-            float p4[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             uint32_t sz = b->direct[0].size < 4 ? b->direct[0].size : 4;
             if (b->direct[0].type == 2) memcpy(p4, src, sz * 4);
-            memcpy(buf[0] + v * 4, p4, 16);
         } else if (b->attrs) {
-            memcpy(buf[0] + v * 4, b->attrs + (size_t)v * NV2A_RAW_ATTRS * 4, 16);
+            memcpy(p4, b->attrs + (size_t)v * NV2A_RAW_ATTRS * 4, 16);
         }
 
-        /* 1: Color (D3DCOLOR BGRA -> RGBA float4) */
+        /* 1: diffuse, D3DCOLOR BGRA -> RGBA float4 */
+        c4[0] = c4[1] = c4[2] = c4[3] = 1.0f;
         if (col_slot >= 0 && (b->attr_direct & (1u << col_slot)) && b->direct[col_slot].ptr) {
             const uint8_t *src = b->direct[col_slot].ptr + (size_t)v * b->direct[col_slot].stride;
             if (b->direct[col_slot].type == 0 || b->direct[col_slot].type == 4) {
-                buf[1][v * 4 + 0] = byte_f(src[2], 0);
-                buf[1][v * 4 + 1] = byte_f(src[1], 0);
-                buf[1][v * 4 + 2] = byte_f(src[0], 0);
-                buf[1][v * 4 + 3] = byte_f(src[3], 0);
+                c4[0] = s_byte_f[src[2]]; c4[1] = s_byte_f[src[1]];
+                c4[2] = s_byte_f[src[0]]; c4[3] = s_byte_f[src[3]];
             } else if (b->direct[col_slot].type == 2) {
-                memcpy(buf[1] + v * 4, src, 16);
+                memcpy(c4, src, 16);
             }
         } else if (col_slot >= 0 && b->attrs) {
-            memcpy(buf[1] + v * 4, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + col_slot) * 4, 16);
-        } else {
-            buf[1][v * 4 + 0] = 1.0f; buf[1][v * 4 + 1] = 1.0f;
-            buf[1][v * 4 + 2] = 1.0f; buf[1][v * 4 + 3] = 1.0f;
+            memcpy(c4, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + col_slot) * 4, 16);
         }
 
-        /* 2: TexCoord0 */
+        /* 2: texcoord0 */
+        t4[0] = t4[1] = t4[2] = 0.0f; t4[3] = 1.0f;
         if (uv_slot >= 0 && (b->attr_direct & (1u << uv_slot)) && b->direct[uv_slot].ptr) {
             const uint8_t *src = b->direct[uv_slot].ptr + (size_t)v * b->direct[uv_slot].stride;
-            float t4[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
             uint32_t sz = b->direct[uv_slot].size < 4 ? b->direct[uv_slot].size : 4;
             if (b->direct[uv_slot].type == 2) memcpy(t4, src, sz * 4);
             else if (b->direct[uv_slot].type == 1) {
                 const int16_t *sp = (const int16_t *)src;
-                for (uint32_t c = 0; c < sz; c++) t4[c] = (float)sp[c];
+                uint32_t c;
+                for (c = 0; c < sz; c++) t4[c] = (float)sp[c];
             }
-            memcpy(buf[2] + v * 4, t4, 16);
         } else if (uv_slot >= 0 && b->attrs) {
-            memcpy(buf[2] + v * 4, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + uv_slot) * 4, 16);
-        } else {
-            buf[2][v * 4 + 0] = 0.0f; buf[2][v * 4 + 1] = 0.0f;
-            buf[2][v * 4 + 2] = 0.0f; buf[2][v * 4 + 3] = 1.0f;
+            memcpy(t4, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + uv_slot) * 4, 16);
         }
     }
 
-    {
-        /* Правило №3: никакого glBufferSubData в кадре. buf[k] — статический
-         * RAM-буфер; glDrawElements прочитает его в этом же вызове.
-         * Клиентский указатель = 0 VBO. */
-        (void)vbo;
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        for (int k = 0; k < 3; k++) {
-            attr_enable((uint32_t)k, 1);
-            glVertexAttribPointer((GLuint)k, 4, GL_FLOAT, GL_FALSE, 16,
-                                  (const void *)buf[k]);
-        }
-    }
+    if (!out) vita_attr_bind(s_vbuf);
     return 1;
 #else
+    (void)out;
 
     VRun run[NV2A_RAW_ATTRS];
     int of_run[NV2A_RAW_ATTRS];
@@ -2080,6 +2231,150 @@ static int upload_vertices(const Nv2aRawBatch *b)
 
 #endif
 }
+
+#if defined(__vita__)
+/* Consecutive screen-space quads with the same target, textures and render
+ * state are merged into one glDrawElements. On the Vita every draw call goes
+ * through vitaGL's command buffer and state validator, which was the larger
+ * half of the profile screen: a text overlay is hundreds of quads that only
+ * differ in their four vertices.
+ *
+ * Only simple triangle/quad batches are merged, and only when the coarse key
+ * below says nothing that affects the picture can have changed. The rest of
+ * gl_draw_raw still runs for each quad (state caching keeps that cheap), so
+ * textures and uniforms are always in the state the merged draw expects. */
+#define UI_MAX_VERTS 8192
+#define UI_MAX_IDX   (UI_MAX_VERTS / 4 * 6)
+static float    s_ui_v[UI_MAX_VERTS * 12];
+static uint16_t s_ui_i[UI_MAX_IDX];
+static uint32_t s_ui_nv, s_ui_ni;
+static uint32_t s_ui_quads, s_ui_batches;
+static int      s_ui_on;
+static uint32_t s_ui_reghash, s_ui_color, s_ui_zeta, s_ui_tex[4], s_ui_pal[4], s_ui_aa;
+static int      s_ui_xform;
+
+static int ui_batch_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("FO2_GL_BATCH");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static uint32_t ui_reg_hash(const uint32_t *r)
+{
+    static const uint16_t off[] = {
+        0x200 / 4, 0x204 / 4, 0x208 / 4, 0x288 / 4, 0x28C / 4,
+        0x300 / 4, 0x304 / 4, 0x308 / 4, 0x30C / 4, 0x32C / 4,
+        0x33C / 4, 0x340 / 4, 0x344 / 4, 0x348 / 4, 0x34C / 4,
+        0x350 / 4, 0x354 / 4, 0x358 / 4, 0x35C / 4,
+        0x360 / 4, 0x364 / 4, 0x368 / 4, 0x36C / 4,
+        0x370 / 4, 0x374 / 4, 0x378 / 4, 0x39C / 4, 0x3A0 / 4,
+        0x1B00 / 4, 0x1B04 / 4, 0x1B08 / 4, 0x1B0C / 4, 0x1B10 / 4,
+        0x1B14 / 4, 0x1B18 / 4, 0x1B1C / 4, 0x1B20 / 4,
+        0x1B40 / 4, 0x1B44 / 4, 0x1B48 / 4, 0x1B4C / 4, 0x1B50 / 4,
+        0x1B80 / 4, 0x1B84 / 4, 0x1B88 / 4, 0x1B8C / 4, 0x1B90 / 4,
+        0x1BC0 / 4, 0x1BC4 / 4, 0x1BC8 / 4, 0x1BCC / 4, 0x1BD0 / 4,
+        0x1E20 / 4, 0x1E24 / 4, 0x1E60 / 4, 0x1E70 / 4, 0x1E78 / 4,
+        0xA60 / 4, 0xA80 / 4, 0xAC0 / 4, 0xAA0 / 4, 0x260 / 4, 0x1E40 / 4
+    };
+    uint32_t h = 2166136261u, i;
+    for (i = 0; i < sizeof off / sizeof off[0]; i++)
+        h = (h ^ r[off[i]]) * 16777619u;
+    return h;
+}
+
+static uint32_t ui_key_hash(const Nv2aRawBatch *b)
+{
+    return ui_reg_hash(b->regs) ^ b->vp_prog_gen ^ (b->vp_const_gen * 31u) ^ s_frame;
+}
+
+static uint32_t ui_aa_bits(const Nv2aRawBatch *b)
+{
+    return (uint32_t)(b->aa_sx * 16.0f) | ((uint32_t)(b->aa_sy * 16.0f) << 16);
+}
+
+static int ui_batchable(const Nv2aRawBatch *b)
+{
+    if (!ui_batch_enabled() || s_finish > 0 || s_watch_hit)
+        return 0;
+    if (b->prim != 8 && b->prim != 5)
+        return 0;
+    if (!b->vertex_count || b->vertex_count > 1024 || b->index_count > 4096)
+        return 0;
+    if (b->prim == 8 && (b->index_count & 3))
+        return 0;
+    if (b->prim == 5 && (b->index_count % 3))
+        return 0;
+    return 1;
+}
+
+static void ui_batch_begin(const Nv2aRawBatch *b)
+{
+    uint32_t i;
+
+    s_ui_on = 1;
+    s_ui_nv = s_ui_ni = 0;
+    s_ui_color = b->surface.color_va;
+    s_ui_zeta = b->zeta_va;
+    s_ui_xform = (int)b->xform;
+    s_ui_aa = ui_aa_bits(b);
+    for (i = 0; i < 4; i++) {
+        s_ui_tex[i] = b->tex_va[i];
+        s_ui_pal[i] = b->pal_va[i];
+    }
+    s_ui_reghash = ui_key_hash(b);
+}
+
+static int ui_can_batch(const Nv2aRawBatch *b)
+{
+    uint32_t i, need;
+
+    if (!s_ui_on || !ui_batchable(b))
+        return 0;
+    need = b->prim == 8 ? b->index_count / 4 * 6 : b->index_count;
+    if (s_ui_nv + b->vertex_count > UI_MAX_VERTS || s_ui_ni + need > UI_MAX_IDX)
+        return 0;
+    if (b->surface.color_va != s_ui_color || b->zeta_va != s_ui_zeta
+        || (int)b->xform != s_ui_xform || ui_aa_bits(b) != s_ui_aa
+        || s_ui_reghash != ui_key_hash(b))
+        return 0;
+    for (i = 0; i < 4; i++)
+        if (b->tex_va[i] != s_ui_tex[i] || b->pal_va[i] != s_ui_pal[i])
+            return 0;
+    return 1;
+}
+
+static void ui_batch_flush(void)
+{
+    if (!s_ui_on || !s_ui_ni) {
+        s_ui_on = 0;
+        s_ui_nv = s_ui_ni = 0;
+        return;
+    }
+    vita_attr_bind(s_ui_v);
+    client_element_buffer();
+    glDrawElements(GL_TRIANGLES, (GLsizei)s_ui_ni, GL_UNSIGNED_SHORT,
+                   (const void *)s_ui_i);
+    s_ui_batches++;
+    s_ui_on = 0;
+    s_ui_nv = s_ui_ni = 0;
+}
+
+static void ui_batch_add(const Nv2aRawBatch *b, const uint32_t *idx, uint32_t n)
+{
+    uint32_t k, base = s_ui_nv;
+
+    for (k = 0; k < n; k++)
+        s_ui_i[s_ui_ni + k] = (uint16_t)(base + idx[k]);
+    s_ui_ni += n;
+    s_ui_nv += b->vertex_count;
+    s_ui_quads++;
+}
+#endif
+
 static void gl_draw_raw(const Nv2aRawBatch *b)
 {
     GlSurf *s;
@@ -2091,9 +2386,22 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     GLintptr idx_at;
     GLenum mode, idx_type = GL_UNSIGNED_INT;
     float tscale[4][2], c0[8][4], c1[8][4], fog[4], surf[4], aa[2];
+#if defined(__vita__)
+    int batch;
+#endif
 
     if (!ready())
         return;
+#if defined(__vita__)
+    /* Flush before touching any GL state: the pending quads were submitted
+     * with the state they still have at this point. */
+    batch = ui_can_batch(b);
+    if (!batch) {
+        ui_batch_flush();
+        if (ui_batchable(b))
+            ui_batch_begin(b);
+    }
+#endif
     s_regs = r;
     s_batch = b;
     s = surf_bind(&b->surface, b->zeta_va);
@@ -2216,6 +2524,10 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         if (p->u_fogp >= 0) nv2a_fog_params(r, b->xform, u.fogp);
         if (p->u_xform >= 0) u.xform = b->xform == 1 ? 1 : 0;
         if (p->u_afunc >= 0) u.afunc = r[0x300 / 4] ? (GLint)r[0x33C / 4] : 0x207;
+#if defined(__vita__)
+        if (p->u_tscale >= 0) memcpy(u.tscale0, tscale[0], sizeof u.tscale0);
+        if (p->u_htex >= 0) u.has_tex = (r[0x1B0C / 4] & 0x40000000u) ? 1 : 0;
+#endif
         if (!p->uni_valid || memcmp(&u, &p->uni, sizeof u) != 0) {
             p->uni = u;
             p->uni_valid = 1;
@@ -2235,13 +2547,11 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             if (p->u_afunc >= 0) glUniform1i(p->u_afunc, u.afunc);
             if (p->u_aref >= 0) glUniform1f(p->u_aref, u.aref);
             if (p->u_fogp >= 0) glUniform4fv(p->u_fogp, 1, u.fogp);
-        }
 #if defined(__vita__)
-        {
-            if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 1, &tscale[0][0]);
-            if (p->u_htex >= 0) glUniform1i(p->u_htex, (r[0x1B0C / 4] & 0x40000000u) ? 1 : 0);
-        }
+            if (p->u_tscale >= 0) glUniform2fv(p->u_tscale, 1, u.tscale0);
+            if (p->u_htex >= 0) glUniform1i(p->u_htex, u.has_tex);
 #endif
+        }
     }
 
     {
@@ -2337,15 +2647,18 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
         }
     }
 
-    apply_state(r, b->zeta_va != 0, s);
-#if defined(__vita__)
-    glDisable(GL_CULL_FACE);
-    if (b->xform != 1) glDisable(GL_DEPTH_TEST);
-#endif
+    apply_state(r, b->zeta_va != 0, s, (int)b->xform);
 
+#if !defined(__vita__)
     glBindVertexArray(s_vao);
-    if (!upload_vertices(b))
+#endif
+#if defined(__vita__)
+    if (!upload_vertices(b, batch ? s_ui_v + (size_t)s_ui_nv * 12 : NULL))
         return;
+#else
+    if (!upload_vertices(b, NULL))
+        return;
+#endif
     {
         /* The absent attributes read the title's SET_VERTEX_DATA* values
          * (Nv2aRawBatch.attr_const); set them only when those or the set of
@@ -2373,6 +2686,13 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
     mode = gl_prim(b, &idx, &n);
     if (!n)
         return;
+#if defined(__vita__)
+    if (batch) {
+        ui_batch_add(b, idx, n);
+        gl_step_done("draw");
+        return;                         /* one draw for the whole run */
+    }
+#endif
 #if !defined(__vita__)
     {
         /* 16-bit indices whenever the batch's vertices allow: half the bytes
@@ -2437,7 +2757,7 @@ static void gl_draw_raw(const Nv2aRawBatch *b)
             if (v_ibuf) {
                 for (uint32_t k = 0; k < n; k++) v_ibuf[k] = (uint16_t)idx[k];
                 /* Правило №3: клиентский указатель, без записи в IBO в кадре. */
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+                client_element_buffer();
                 glDrawElements(mode, (GLsizei)n, GL_UNSIGNED_SHORT,
                                (const void *)v_ibuf);
             }
@@ -2475,6 +2795,9 @@ static void gl_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
     GLbitfield bits = 0;
     float c[4];
 
+#if defined(__vita__)
+    ui_batch_flush();                   /* a clear ends any run of quads */
+#endif
     state_dirty();
 
     if (!ready())
@@ -2557,6 +2880,9 @@ extern void nv2a_host_frame_presented(uint32_t width, uint32_t height) __attribu
 
 static void gl_flip(void)
 {
+#if defined(__vita__)
+    ui_batch_flush();                   /* present the merged quads first */
+#endif
     state_dirty();
     static int dump_every = -1;
     static char dump_prefix[256];
@@ -2614,6 +2940,11 @@ static void gl_flip(void)
                 xbox_vblank_report(dt, vb, sizeof vb);
                 fprintf(stderr, "[fps] %.1f fps (frame %u), %s\n",
                         (s_frame - last_frame) / dt, s_frame, vb);
+#if defined(__vita__)
+                fprintf(stderr, "[ui] %u quads in %u merged draws (batching %s)\n",
+                        s_ui_quads, s_ui_batches, ui_batch_enabled() ? "on" : "off");
+                s_ui_quads = s_ui_batches = 0;
+#endif
                 last_frame = s_frame;
                 last = now;
             }
@@ -2670,8 +3001,8 @@ static void gl_flip(void)
      * creation size). */
 #if defined(__vita__)
     ww = 960; wh = 544;
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, 960, 544);
+    fbo_bind(0);
+    viewport_set(960, 544);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -2712,7 +3043,7 @@ static void gl_flip(void)
                 -1.0f,  1.0f, 0.0f, v1,
                   1.0f,  1.0f,   u1, v1
             };
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            client_array_buffer();
             glEnableVertexAttribArray(0);
             glEnableVertexAttribArray(1);
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, qv);
@@ -2721,7 +3052,9 @@ static void gl_flip(void)
             glDisableVertexAttribArray(0);
             glDisableVertexAttribArray(1);
             s_attr_on = 0;
+            vita_attr_forget();         /* the draw pointers are stack ones now */
             glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
+            s_abuf_bound = (int)s_vbo;
         }
     }
 swap:

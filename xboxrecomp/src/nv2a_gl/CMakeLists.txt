@@ -32,4 +32,8 @@ else()
 endif()
 if(NOT MSVC)
     target_compile_options(xbox_nv2a_gl PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    if(VITA)
+        target_compile_options(xbox_nv2a_gl PRIVATE
+            -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -ffast-math)
+    endif()
 endif()

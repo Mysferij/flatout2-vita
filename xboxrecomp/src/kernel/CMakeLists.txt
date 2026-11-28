@@ -69,6 +69,10 @@ if(MSVC)
     target_compile_definitions(xbox_kernel PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(xbox_kernel PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    if(VITA)
+        target_compile_options(xbox_kernel PRIVATE
+            -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard)
+    endif()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)

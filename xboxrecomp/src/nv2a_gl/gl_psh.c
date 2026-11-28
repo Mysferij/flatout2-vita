@@ -494,7 +494,7 @@ int nv2a_gl_psh(const Nv2aPshKey *k, char *buf, size_t cap)
     } else
 #if defined(__vita__)
     emit(&o,
-        "precision highp float;\n"
+        "precision mediump float;\n"
         "varying vec4 vD0; varying vec4 vD1; varying vec4 vT0; varying vec4 vT1;\n"
         "varying vec4 vT2; varying vec4 vT3; varying float vFog;\n"
         "uniform sampler2D t0; uniform sampler2D t1;\n"

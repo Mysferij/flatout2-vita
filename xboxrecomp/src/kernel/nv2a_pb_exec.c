@@ -70,6 +70,24 @@ static uint8_t *guest_span_host(uint32_t va, uint64_t bytes)
 #endif
 }
 
+#if defined(__vita__)
+/* Vertex arrays, index buffers and font atlases are overwhelmingly in plain
+ * guest RAM, which is one flat mapping on the Vita. xbox_GuestHostRange has
+ * to classify the address on every call; that was one call per attribute per
+ * vertex in fetch_attr. Take the flat path when the whole span is in RAM and
+ * keep the checked lookup for the contiguous / tiled aliases. */
+static uint8_t *guest_span_host_fast(uint32_t va, uint64_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+
+    if (end <= (uint64_t)g_xbox_total_ram)
+        return (uint8_t *)xbox_GetMemoryOffset() + va;
+    return guest_span_host(va, bytes);
+}
+#else
+#define guest_span_host_fast(va, bytes) guest_span_host((va), (bytes))
+#endif
+
 /* Bytes a texture image can occupy: linear images are pitch * height, swizzled
  * and DXT ones are at most 4 bytes per texel, so take the larger of the two. */
 static uint64_t texture_span_bytes(uint32_t width, uint32_t height, uint32_t pitch)
@@ -81,6 +99,10 @@ static uint64_t texture_span_bytes(uint32_t width, uint32_t height, uint32_t pit
 /* Methods executed after the first CLEAR_SURFACE, traced one by one. */
 static unsigned s_pbx_clears_seen, s_pbx_after_clear;
 #define PBX_AFTER_CLEAR_MAX 400
+#define PBX_METHOD_TRACE(...) do { \
+    if (s_pbx_clears_seen && s_pbx_after_clear < PBX_AFTER_CLEAR_MAX) \
+        pbx_method_trace(__VA_ARGS__); \
+} while (0)
 
 /* The NV2A register block as the guest sees it at 0xFD000000. Not
  * xbox_GetMemoryOffset() + 0xFD000000: on PS Vita the block is its own host
@@ -635,7 +657,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         {
             uint64_t gva = (uint64_t)a->offset + (uint64_t)index * a->stride;
             p = gva <= 0xFFFFFFFFu
-                ? (const uint8_t *)xbox_GuestHostRange((uint32_t)gva, 4u * a->size)
+                ? guest_span_host_fast((uint32_t)gva, 4u * a->size)
                 : NULL;
             if (!p) {
                 static unsigned refused;
@@ -3186,8 +3208,8 @@ static int cull_bbox(uint32_t lo, uint32_t nv, float bmin[3], float bmax[3])
         /* Element 0 of the array, through to the last element read here: the
          * whole span must be mapped host memory, or the box is not computed
          * (no cull). Same reason as fetch_attr. */
-        base = xbox_GuestHostRange(a->offset,
-                                   (uint64_t)(lo + nv - 1) * a->stride + 4u * a->size);
+        base = guest_span_host_fast(a->offset,
+                                    (uint64_t)(lo + nv - 1) * a->stride + 4u * a->size);
         if (!base)
             return 0;
 #else
@@ -3553,7 +3575,7 @@ static uint16_t raw_direct_attrs(Nv2aRawBatch *rb, uint16_t present,
             (void)mem;
             if (first > 0xFFFFFFFFu)
                 continue;
-            rb->direct[a].ptr = (const uint8_t *)xbox_GuestHostRange((uint32_t)first, end - first);
+            rb->direct[a].ptr = guest_span_host_fast((uint32_t)first, end - first);
             if (!rb->direct[a].ptr)
                 continue;
 #else
@@ -4515,7 +4537,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
-    pbx_method_trace(subch, method, param, 1);
+    PBX_METHOD_TRACE(subch, method, param, 1);
 
     /* The shadow is the 3D class's register file: methods to the other
      * subchannels (2D surfaces, blits) share its offsets and must not land
@@ -4865,11 +4887,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              * retired them, and D3D's two-entry flip queue was overwritten:
              * NFSU2's PersistDisplay then waited on a flip whose vblank had
              * gone by. */
-#if defined(__vita__)
-            ULONGLONG give_up = GetTickCount64();
-#else
+#if !defined(__vita__)
             ULONGLONG give_up = GetTickCount64() + 250;
-#endif
             for (;;) {
                 flip_apply_retired();
                 if (s_gpu->flip_read != s_gpu->flip_write)
@@ -4894,6 +4913,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 DWORD remain = (DWORD)(give_up - GetTickCount64());
                 WaitForSingleObject(driver_event(), remain > 0 ? remain : 1);
             }
+#else
+            /* The Vita back end presents the frame in this very thread, at
+             * this flip: nothing is scanning a second buffer, so there is no
+             * retire to wait for. The previous code gave up at once, stepped
+             * the read index out of sync with the driver and still parked the
+             * core in a 1 ms cond-wait. Drain the counter and complete the
+             * stall right here. */
+            flip_apply_retired();
+            s_gpu->flip_read = s_gpu->flip_write;
+#endif
         } else {
             /* The stall ends when the buffer being read is the one just
              * finished. Nothing reports retired flips, so that is now. */
@@ -5051,7 +5080,7 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
         return 0;
     if (method == NV097_ARRAY_ELEMENT16 && (noninc || count == 1)) {
         uint32_t w = NV097_ARRAY_ELEMENT16 / 4;
-        pbx_method_trace(subch, method, p[count - 1], count);
+        PBX_METHOD_TRACE(subch, method, p[count - 1], count);
         PBX_FIRST(64, "fast: ARRAY_ELEMENT16 x%u (last 0x%08X, prim %u)",
                   count, p[count - 1], s_gpu->prim);
         if (s_reg[w] != p[count - 1]) {      /* only the last value is seen */
@@ -5065,10 +5094,29 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc,
             }
         return count;
     }
+    if (method == NV097_INLINE_ARRAY && noninc) {
+        /* Text and 2D overlays submit their vertices as one long INLINE_ARRAY
+         * run. Copying the payload once instead of one method call per dword
+         * is the single biggest executor win in the profile screen. */
+        uint32_t w = NV097_INLINE_ARRAY / 4, n = count;
+        PBX_METHOD_TRACE(subch, method, p[count - 1], count);
+        PBX_FIRST(64, "fast: INLINE_ARRAY x%u (prim %u)", count, s_gpu->prim);
+        if (s_reg[w] != p[count - 1]) {
+            s_reg[w] = p[count - 1];
+            s_reg_dirty[w >> 4] = 1;
+        }
+        if (s_gpu->prim) {
+            uint32_t room = NV_MAX_INLINE - s_gpu->inline_count;
+            if (n > room) n = room;
+            memcpy(s_gpu->inline_buf + s_gpu->inline_count, p, (size_t)n * 4);
+            s_gpu->inline_count += n;
+        }
+        return count;
+    }
     if (!noninc && method >= NV097_SET_TRANSFORM_CONSTANT
         && method + count * 4 <= NV097_SET_TRANSFORM_CONSTANT + 0x80) {
         uint32_t slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
-        pbx_method_trace(subch, method, p[count - 1], count);
+        PBX_METHOD_TRACE(subch, method, p[count - 1], count);
         PBX_FIRST(64, "fast: TRANSFORM_CONSTANT x%u at 0x%04X", count, method);
         for (i = 0; i < count; i++, slot++) {
             uint32_t w = (method / 4) + i;

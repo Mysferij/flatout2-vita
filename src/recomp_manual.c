@@ -27,6 +27,9 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#if defined(__vita__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 /* The generated register model (g_eax/g_esp are thread-local there) and the
  * XBOX_PTR/MEM32 accessors; the register names below are its macros. */
@@ -79,8 +82,19 @@ static void crt_memmove(void)
     uint32_t src = MEM32(esp + 8);
     uint32_t n   = MEM32(esp + 12);
 
-    if (n)
-        memmove((void *)XBOX_PTR(dst), (const void *)XBOX_PTR(src), n);
+    if (n) {
+#if defined(__vita__) && defined(__ARM_NEON)
+        uint8_t *d = (uint8_t *)XBOX_PTR(dst);
+        const uint8_t *s = (const uint8_t *)XBOX_PTR(src);
+        if (n >= 32 && !(((uintptr_t)d | (uintptr_t)s | (uintptr_t)n) & 15u) &&
+            (d + n <= s || s + n <= d)) {
+            uint32_t i;
+            for (i = 0; i < n; i += 16)
+                vst1q_u8(d + i, vld1q_u8(s + i));
+        } else
+#endif
+            memmove((void *)XBOX_PTR(dst), (const void *)XBOX_PTR(src), n);
+    }
     eax = dst;
     esp += 4;   /* return address; cdecl, the caller pops the arguments */
 }

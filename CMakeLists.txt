@@ -138,6 +138,13 @@ else()
     endif()
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
         COMPILE_OPTIONS "${NFSU2_GEN_FLAGS}")
+    if(VITA)
+        # Native leaves only: recomp_manual.c is compiled once, unlike the
+        # 47 lifted chunks above, so it can use the A9/NEON pipeline. No
+        # -ffast-math here: _ftol2/_atodbl/XMV rely on exact float semantics.
+        set_property(SOURCE src/recomp_manual.c APPEND PROPERTY
+            COMPILE_OPTIONS "-mcpu=cortex-a9;-mfpu=neon;-mfloat-abi=hard;-O3")
+    endif()
     target_link_libraries(${PROJECT_NAME} PRIVATE m)
 endif()
 
